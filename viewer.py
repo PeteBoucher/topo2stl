@@ -103,6 +103,7 @@ PAGE = r"""<!doctype html>
 import * as THREE from 'three';
 import { STLLoader } from 'three/addons/loaders/STLLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
 
 const canvas = document.getElementById('c');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
@@ -230,7 +231,12 @@ function frame(geometry) {
   controls.update();
 }
 
-function setModel(geometry, refit) {
+function setModel(rawGeometry, refit) {
+  // STL is a triangle soup -> weld shared vertices so normals can be smooth
+  // (otherwise every facet is flat-shaded and the surface looks corrugated).
+  let geometry;
+  try { geometry = mergeVertices(rawGeometry, 1e-3); rawGeometry.dispose(); }
+  catch (_) { geometry = rawGeometry; }
   geometry.computeVertexNormals();
   geometry.computeBoundingBox();
   const size = new THREE.Vector3(); geometry.boundingBox.getSize(size);
@@ -251,7 +257,9 @@ function setModel(geometry, refit) {
   swWorld = new THREE.Vector3(bb.min.x, bb.min.y, bb.min.z);
   neWorld = new THREE.Vector3(bb.max.x, bb.max.y, bb.min.z);
 
-  $('tris').textContent = (geometry.attributes.position.count / 3).toLocaleString();
+  const nTri = geometry.index ? geometry.index.count / 3
+                              : geometry.attributes.position.count / 3;
+  $('tris').textContent = nTri.toLocaleString();
   $('sx').textContent = size.x.toFixed(1);
   $('sy').textContent = size.y.toFixed(1);
   $('sz').textContent = size.z.toFixed(1);

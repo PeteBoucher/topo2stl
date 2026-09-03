@@ -79,6 +79,7 @@ python topo2stl.py --bbox 36.98,-3.45,37.10,-3.28 --ign-res 5 \
 | `--grid N` / `--grid ROWSxCOLS` | Output sampling. `N` auto-picks rows/cols from the area's real aspect ratio. ~`300` ≈ 180k triangles ≈ 9 MB STL. |
 | `--model-width` | Printed width in mm (E–W). Depth and height follow to true scale. |
 | `--z-exaggeration` | Vertical multiplier. `1.0` = true scale (usually too flat). `1.5`–`3` for mountains, more for lowlands. |
+| `--smooth` | Gaussian-blur the elevation grid, sigma in cells. `~1` cleans the fine resampling weave that shows up on large areas / high exaggeration. Applied after download — the cache is untouched, so trying values is instant. |
 | `--base` | Solid mm beneath the lowest terrain point. |
 | `--sea-level` | Height measured from 0 m rather than the tile minimum. |
 | `--emboss-coords` | Engrave each side wall's edge coordinate (see below). |
@@ -168,6 +169,9 @@ requirements.txt
 - Print with the base flat on the bed; terrain needs no supports.
 - 0.12–0.16 mm layers bring out ridgelines.
 - Keep `--emboss-depth` well under your wall thickness.
+- For a large area, prefer a higher `--grid` (closer to the source resolution)
+  and a touch of `--smooth` over a coarse grid — the coarse grid keeps the
+  server's resampling weave.
 
 ---
 

@@ -48,6 +48,10 @@ EARTH_M_PER_DEG_LAT = 111_320.0
 IGN_WCS_URL = "https://servicios.idee.es/wcs-inspire/mdt"
 IGN_COVERAGE = {5: "Elevacion4258_5", 25: "Elevacion4258_25"}
 
+# Bump when the fetch/parse/resample pipeline changes in a way that alters the
+# stored grid — old cache files with a different version are ignored.
+CACHE_VERSION = 1
+
 CACHE_DIR = Path(__file__).parent / "cache"
 
 
@@ -269,12 +273,13 @@ def download_grid_ign(bbox, rows, cols, ign_res, verbose) -> np.ndarray:
 def cached_grid(source, key, bbox, rows, cols, unit, ign_res,
                 verbose, no_cache) -> np.ndarray:
     CACHE_DIR.mkdir(exist_ok=True)
-    sig = json.dumps({"source": source, "bbox": [round(b, 8) for b in bbox],
+    sig = json.dumps({"v": CACHE_VERSION, "source": source,
+                      "bbox": [round(b, 6) for b in bbox],   # ~0.1 m; dedupes near-identical requests
                       "rows": rows, "cols": cols, "unit": unit,
                       "ign_res": ign_res if source == "ign" else None},
                      sort_keys=True)
     h = hashlib.sha1(sig.encode()).hexdigest()[:16]
-    path = CACHE_DIR / f"grid_{source}_{rows}x{cols}_{h}.npy"
+    path = CACHE_DIR / f"grid_{source}_v{CACHE_VERSION}_{rows}x{cols}_{h}.npy"
     if path.exists() and not no_cache:
         print(f"Using cached elevation grid: {path.name}")
         return np.load(path)
@@ -295,6 +300,30 @@ def cached_grid(source, key, bbox, rows, cols, unit, ign_res,
     np.save(path, grid)
     print(f"Cached elevation grid -> {path.name}")
     return grid
+
+
+# --------------------------------------------------------------------------- #
+# Grid smoothing
+# --------------------------------------------------------------------------- #
+def gaussian_blur(a: np.ndarray, sigma: float) -> np.ndarray:
+    """Separable Gaussian blur, sigma in grid cells, edge-reflected. numpy only."""
+    if sigma <= 0:
+        return a
+    r = max(1, int(round(sigma * 3)))
+    x = np.arange(-r, r + 1)
+    k = np.exp(-(x * x) / (2.0 * sigma * sigma))
+    k /= k.sum()
+    out = a.astype(np.float64)
+    for axis in (0, 1):
+        pad = [(r, r) if i == axis else (0, 0) for i in range(2)]
+        ap = np.pad(out, pad, mode="reflect")
+        acc = np.zeros_like(out)
+        for t, w in enumerate(k):
+            sl = [slice(None), slice(None)]
+            sl[axis] = slice(t, t + out.shape[axis])
+            acc += w * ap[tuple(sl)]
+        out = acc
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -330,16 +359,24 @@ def build_mesh(grid_m: np.ndarray, bbox, model_width_mm: float,
 
     tris: list = []
 
-    def quad(a, b, c, d):
+    def quad(a, b, c, d, flip=False):
         # quad a->b->c->d listed counter-clockwise as seen from OUTSIDE the
-        # solid; emits two outward-facing triangles.
-        tris.append((a, b, c))
-        tris.append((a, c, d))
+        # solid; emits two outward-facing triangles. `flip` picks the other
+        # diagonal (b-d instead of a-c).
+        if flip:
+            tris.append((a, b, d))
+            tris.append((b, c, d))
+        else:
+            tris.append((a, b, c))
+            tris.append((a, c, d))
 
-    # top surface: CCW seen from +Z  ->  normals point up
+    # top surface: CCW seen from +Z -> normals point up. Alternate the split
+    # diagonal per cell so the triangulation has no directional bias (which
+    # otherwise shows as fine corrugation on exaggerated slopes).
     for i in range(rows - 1):
         for j in range(cols - 1):
-            quad(top[i, j], top[i + 1, j], top[i + 1, j + 1], top[i, j + 1])
+            quad(top[i, j], top[i + 1, j], top[i + 1, j + 1], top[i, j + 1],
+                 flip=(i + j) % 2 == 1)
 
     # bottom: CCW seen from -Z  ->  normals point down
     for i in range(rows - 1):
@@ -657,6 +694,10 @@ def parse_args(argv=None):
                    help="printed model width in mm (E-W)")
     p.add_argument("--z-exaggeration", type=float, default=1.5,
                    help="vertical scale multiplier vs true scale")
+    p.add_argument("--smooth", type=float, default=0.0,
+                   help="Gaussian blur the elevation grid, sigma in cells "
+                        "(~0.8-1.5 removes server-resampling weave on large "
+                        "areas; applied after download, cache is untouched)")
     p.add_argument("--base", type=float, default=3.0,
                    help="solid base thickness in mm below the lowest terrain point")
     p.add_argument("--sea-level", action="store_true",
@@ -735,6 +776,10 @@ def main(argv=None):
     if a.source == "tessadem" and a.unit == "feet":
         grid_m = grid_m * 0.3048      # mesh math is metric (IGN is always metres)
 
+    if a.smooth > 0:                   # post-download; does not touch the cache
+        grid_m = gaussian_blur(grid_m, a.smooth)
+        print(f"Smoothed grid (sigma {a.smooth} cells)")
+
     tris, info = build_mesh(grid_m, bbox, a.model_width, a.z_exaggeration,
                             a.base, a.sea_level)
 
@@ -757,6 +802,7 @@ def main(argv=None):
         "grid": [rows, cols],
         "elev_m_per_mm": round(info["m_per_mm"], 4),   # for the viewer's contour lines
         "base_mm": a.base,
+        "smooth": a.smooth,
     }
     meta_path = out.with_name(out.stem + ".topo.json")
     meta_path.write_text(json.dumps(meta, indent=2))
