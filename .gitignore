@@ -1,0 +1,23 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.ruff_cache/
+
+# Downloaded elevation grids (regenerated on demand)
+cache/
+
+# Generated models and their sidecars — not tracked
+*.stl
+*.3mf
+*.obj
+*.gcode
+*.topo.json
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
