@@ -4,11 +4,6 @@ Loose list of things to do, roughly in priority order.
 
 ## Ideas
 
-- **Embed data attribution in the output.** Write the required IGN / TessaDEM
-  attribution string into the binary STL 80-byte header *and* the `.topo.json`
-  sidecar, so every model produced is licence-compliant by default (matters if
-  the prints are sold). Header e.g.
-  `topo2stl | Elevation data (c) IGN España (CNIG)`.
 - **Buildings and monuments** Explore the idea of obtaining 3d model information for buildings in cities to add to small scale maps in city centres.
 - Optional hillshade / contour bake into the printed surface itself.
 - `--preset` shelf (e.g. `wall-tile`, `desk`, `keyring`) bundling size + base +

@@ -639,7 +639,20 @@ def emboss_corner_coords(tris: list, info: dict, bbox, cap_mm: float,
     return np.asarray(tris, dtype=np.float32)
 
 
-def write_binary_stl(tris: np.ndarray, path: Path, name: str = "topo"):
+def data_attribution(source: str, ign_res: int | None = None) -> tuple[str, str]:
+    """(full credit line for the sidecar, ASCII short form for the 80-byte STL header)."""
+    if source == "ign":
+        return ("Elevation data © Instituto Geográfico Nacional de "
+                "España (CNIG) — https://www.ign.es — CC-BY 4.0 "
+                "compatible, attribution required",
+                "topo2stl | Elevation (c) IGN Espana / CNIG")
+    if source == "tessadem":
+        return ("Elevation data via the TessaDEM API — https://tessadem.com",
+                "topo2stl | Elevation via TessaDEM")
+    return ("", "topo2stl")
+
+
+def write_binary_stl(tris: np.ndarray, path: Path, header: str = "topo2stl"):
     n = len(tris)
     v0 = tris[:, 0, :]
     v1 = tris[:, 1, :]
@@ -650,8 +663,10 @@ def write_binary_stl(tris: np.ndarray, path: Path, name: str = "topo"):
     normals = normals / lens
 
     with open(path, "wb") as f:
-        header = f"{name} - topo2stl".encode()[:80]
-        f.write(header + b"\x00" * (80 - len(header)))
+        h = header.encode("ascii", "replace")[:80]
+        if h[:5].lower() == b"solid":        # never let a binary STL start with "solid"
+            h = (b"topo2stl " + h)[:80]
+        f.write(h + b"\x00" * (80 - len(h)))
         f.write(struct.pack("<I", n))
         buf = bytearray()
         for i in range(n):
@@ -792,7 +807,10 @@ def main(argv=None):
 
     out = Path(a.output) if a.output else Path(
         f"topo_{min_lat:.3f}_{min_lon:.3f}_{rows}x{cols}.stl")
-    write_binary_stl(tris, out)
+    credit, stl_header = data_attribution(a.source, a.ign_res)
+    write_binary_stl(tris, out, stl_header)
+    if credit:
+        print(f"  attribution (required if published/sold): {credit}")
 
     # sidecar the viewer reads to label the SW / NE corners with real coords
     meta = {
@@ -803,9 +821,12 @@ def main(argv=None):
         "elev_m_per_mm": round(info["m_per_mm"], 4),   # for the viewer's contour lines
         "base_mm": a.base,
         "smooth": a.smooth,
+        "generator": "topo2stl",
+        "attribution": credit,
     }
     meta_path = out.with_name(out.stem + ".topo.json")
-    meta_path.write_text(json.dumps(meta, indent=2))
+    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False),
+                         encoding="utf-8")
     print(f"Wrote {meta_path}")
 
     if a.view:

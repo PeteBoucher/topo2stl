@@ -189,6 +189,11 @@ publish or **sell** anything made with this tool, credit the data source:
 - **TessaDEM (`--source tessadem`)** — a commercial API; follow
   [their terms of service](https://tessadem.com/) for the plan you're on.
 
+Every run embeds the credit line in the STL's 80-byte header and in the
+`.topo.json` sidecar (`"attribution"`), and prints it to the console — but the
+header is easily lost when a model is re-exported, so still add the credit to
+whatever you publish or sell.
+
 This project is not affiliated with or endorsed by the IGN, the CNIG, the Junta
 de Andalucía, or TessaDEM.
 
