@@ -12,6 +12,15 @@ Loose list of things to do, roughly in priority order.
   - [ ] Strategy B: OSM / Catastro vector footprints for crisp edges.
   - [ ] `--landmark "lat,lon,file.stl"` — drop a custom monument mesh.
   - [ ] Water mask — recess rivers/coast as a channel (Micropolitan style).
+- **viewer.py lifecycle** — `--view` starts the server detached
+  (`start_new_session=True`) so it outlives the shell and a later
+  `viewer.py X.stl` just hits "port busy". Add:
+  - `/quit` POST endpoint → server calls `srv.shutdown()` on itself.
+  - `viewer.py --kill` — POST `/quit`, exit; "nothing running" if free.
+  - `viewer.py X.stl --replace` — kill any running viewer, then start fresh
+    on X.stl; make `topo2stl --view` use this so re-runs always land on the
+    right file.
+  - maybe `viewer.py --status` — print the running viewer's current STL.
 - Optional hillshade / contour bake into the printed surface itself.
 - `--preset` shelf (e.g. `wall-tile`, `desk`, `keyring`) bundling size + base +
   exaggeration.
@@ -19,10 +28,9 @@ Loose list of things to do, roughly in priority order.
 
 ## Known issues
 
-- **Surface corrugation on large-scale models.** IGN's WCS resamples its native
-  grid server-side when `SCALESIZE` asks for far fewer samples than the source
-  has, leaving a fine weave in the data; Z-exaggeration makes it obvious.
-  Handled: alternating triangulation diagonal, smooth normals in the viewer,
-  `--smooth SIGMA` (Gaussian on the grid, sigma ~1 clears it), README guidance
-  to raise `--grid`. Possible next step: auto-pick a default `--smooth` from the
-  download vs. native-resolution ratio.
+- **Surface corrugation / blockiness from WCS resampling.** IGN's WCS resamples
+  its native grid server-side; downsampling leaves a fine weave, upsampling
+  leaves native-post blocks. Handled: alternating triangulation diagonal,
+  smooth normals in the viewer, `--smooth auto` (sigma scales to the
+  up/downsample ratio), README guidance to raise `--grid`. Largely resolved;
+  revisit only if specific cases still look bad.
