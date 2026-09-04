@@ -1,7 +1,12 @@
 # Scope: buildings & monuments on city-centre maps
 
-Status: **Strategy A shipped** (`--buildings`). Strategy B / landmarks / water
-mask still open. Parent: BACKLOG.md "Buildings and monuments".
+Status: **A and B shipped.** `--building-source osm` (default) extrudes OSM
+footprints; `raster` / `raster-classified` use IGN LiDAR. Landmarks, Catastro,
+water mask, courtyard footprints still open. Parent: BACKLOG.md.
+
+OSM coverage check (0.4 x 0.6 km around the Mezquita): 392 buildings, **96 %
+tagged `building:levels`**, ~15 vertices/footprint. Granada centre similar.
+`levels x 3 m` gives real per-building heights for nearly all of them.
 
 ## Goal
 

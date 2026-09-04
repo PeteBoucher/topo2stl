@@ -311,6 +311,104 @@ def download_buildings_ign(bbox, rows, cols, method, verbose) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
+# OpenStreetMap building footprints (Overpass)
+# --------------------------------------------------------------------------- #
+OVERPASS_ENDPOINTS = (
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+)
+
+
+def fetch_osm_buildings(bbox, verbose, no_cache) -> list:
+    """List of {'coords': [(lon,lat), ...], 'tags': {...}} for every OSM
+    building way in the bbox. Cached as raw Overpass JSON."""
+    if requests is None:
+        raise RuntimeError("The 'requests' package is required.")
+    CACHE_DIR.mkdir(exist_ok=True)
+    min_lat, min_lon, max_lat, max_lon = bbox
+    sig = f"{CACHE_VERSION}|{min_lat:.6f},{min_lon:.6f},{max_lat:.6f},{max_lon:.6f}"
+    path = CACHE_DIR / f"osm_v{CACHE_VERSION}_{hashlib.sha1(sig.encode()).hexdigest()[:16]}.json"
+
+    if path.exists() and not no_cache:
+        print(f"Using cached OSM buildings: {path.name}")
+        data = json.loads(path.read_text())
+    else:
+        q = (f"[out:json][timeout:90];"
+             f'way["building"]({min_lat},{min_lon},{max_lat},{max_lon});'
+             f"out tags geom;")
+        headers = {"User-Agent": "topo2stl/1.0 (+https://github.com/petebouch/topo2stl)"}
+        data = None
+        for ep in OVERPASS_ENDPOINTS:
+            try:
+                print(f"Querying Overpass ({ep.split('/')[2]}) for buildings ...")
+                r = requests.post(ep, data={"data": q}, headers=headers, timeout=120)
+                if r.status_code == 200 and r.content[:1] == b"{":
+                    data = r.json()
+                    break
+                print(f"  {ep.split('/')[2]}: HTTP {r.status_code}")
+            except requests.RequestException as e:
+                print(f"  {ep.split('/')[2]}: {e}")
+        if data is None:
+            raise SystemExit("Overpass unavailable - try again later, or use "
+                             "--building-source raster")
+        path.write_text(json.dumps(data))
+        print(f"Cached OSM buildings -> {path.name}")
+
+    out = []
+    for el in data.get("elements", []):
+        if el.get("type") != "way" or "geometry" not in el:
+            continue
+        pts = [(p["lon"], p["lat"]) for p in el["geometry"]]
+        if len(pts) >= 4:                       # closed ring (first == last)
+            out.append({"coords": pts, "tags": el.get("tags", {})})
+    if verbose:
+        print(f"  {len(out)} building ways")
+    return out
+
+
+def _building_height_m(tags: dict, level_h: float, default_h: float) -> float:
+    for key in ("height", "building:height"):
+        if key in tags:
+            try:
+                return max(1.0, float(str(tags[key]).split()[0].replace(",", ".")))
+            except ValueError:
+                pass
+    if "building:levels" in tags:
+        try:
+            lv = float(str(tags["building:levels"]).split(";")[0].replace(",", "."))
+            rl = float(str(tags.get("roof:levels", 0) or 0).split(";")[0])
+            return max(2.0, (lv + 0.5 * rl) * level_h)
+        except ValueError:
+            pass
+    return default_h
+
+
+def _poly_area(pts) -> float:
+    s = 0.0
+    for (x1, y1), (x2, y2) in zip(pts, pts[1:] + pts[:1]):
+        s += x1 * y2 - x2 * y1
+    return 0.5 * s
+
+
+def _simplify(pts, tol):
+    """Douglas-Peucker on an open point list."""
+    if len(pts) < 3:
+        return pts
+    (ax, ay), (bx, by) = pts[0], pts[-1]
+    dx, dy = bx - ax, by - ay
+    seg = math.hypot(dx, dy) or 1e-9
+    dmax, idx = 0.0, 0
+    for i in range(1, len(pts) - 1):
+        px, py = pts[i]
+        d = abs(dy * px - dx * py + bx * ay - by * ax) / seg
+        if d > dmax:
+            dmax, idx = d, i
+    if dmax <= tol:
+        return [pts[0], pts[-1]]
+    return _simplify(pts[:idx + 1], tol)[:-1] + _simplify(pts[idx:], tol)
+
+
+# --------------------------------------------------------------------------- #
 # Cache dispatch
 # --------------------------------------------------------------------------- #
 def cached_grid(source, key, bbox, rows, cols, unit, ign_res,
@@ -481,6 +579,8 @@ def build_mesh(grid_m: np.ndarray, bbox, model_width_mm: float,
         "north_z": z[0].copy(),               # x: 0 -> W
         "west_z": z[::-1, 0].copy(),          # y: 0 -> H
         "east_z": z[::-1, cols - 1].copy(),   # y: 0 -> H
+        "z_mm": z.copy(),                     # full model-Z grid (mm), row0=north
+        "mm_per_m": mm_per_m,                 # model mm per real horizontal metre
     }
     return tris, info
 
@@ -572,15 +672,140 @@ def _have_manifold() -> bool:
         return False
 
 
+def _soup_to_manifold(tris):
+    """(n,3,3) triangle soup -> welded manifold3d.Manifold."""
+    import manifold3d as m3d
+    soup = np.asarray(tris, dtype=np.float64).reshape(-1, 3)
+    uniq, inv = np.unique(np.round(soup, 6), axis=0, return_inverse=True)
+    return m3d.Manifold(m3d.Mesh(vert_properties=uniq.astype(np.float32),
+                                 tri_verts=inv.reshape(-1, 3).astype(np.uint32)))
+
+
+def _manifold_to_soup(res) -> np.ndarray:
+    """manifold3d result -> (n,3,3) float32 soup. Welds the vertices manifold3d
+    flags as coincident (union-find, so chains resolve) and drops only
+    exactly-degenerate triangles."""
+    mesh = res.to_mesh()
+    verts = np.asarray(mesh.vert_properties)[:, :3].astype(np.float32)
+    tv = np.asarray(mesh.tri_verts).astype(np.int64)
+    mf = np.asarray(mesh.merge_from_vert)
+    mt = np.asarray(mesh.merge_to_vert)
+    if mf.size:
+        parent = np.arange(len(verts))
+
+        def find(i):
+            r = i
+            while parent[r] != r:
+                r = parent[r]
+            while parent[i] != r:
+                parent[i], i = r, parent[i]
+            return r
+
+        for a, b in zip(mf.tolist(), mt.tolist()):
+            parent[find(a)] = find(b)
+        tv = np.array([find(i) for i in range(len(verts))], dtype=np.int64)[tv]
+
+    out = verts[tv]
+    degen = ((out[:, 0] == out[:, 1]).all(1) |
+             (out[:, 1] == out[:, 2]).all(1) |
+             (out[:, 0] == out[:, 2]).all(1))
+    return out[~degen]
+
+
+def add_osm_buildings(base_tris: list, info: dict, bbox, footprints: list,
+                      level_h: float, default_h: float, exaggeration: float,
+                      min_area_m2: float, simplify_mm: float) -> np.ndarray:
+    """Extrude each OSM footprint to a prism seated on the terrain and union
+    the lot onto the terrain solid. Returns an (n,3,3) float32 soup."""
+    if not _have_manifold():
+        raise SystemExit("--building-source osm needs manifold3d:\n"
+                         "  ./.venv/bin/pip install -r requirements.txt")
+    import manifold3d as m3d
+
+    min_lat, min_lon, max_lat, max_lon = bbox
+    W, H = info["model_w"], info["model_h"]
+    mm_per_m = info["mm_per_m"]
+    z_mm = info["z_mm"]                        # (rows, cols) model-Z, row0 = north
+    rows, cols = z_mm.shape
+    min_area_mm2 = min_area_m2 * mm_per_m * mm_per_m
+
+    def to_xy(lon, lat):
+        return ((lon - min_lon) / (max_lon - min_lon) * W,
+                (lat - min_lat) / (max_lat - min_lat) * H)
+
+    def terrain_z_max_under(poly):
+        xs = [p[0] for p in poly]
+        ys = [p[1] for p in poly]
+        cx = np.clip(np.array([min(xs), max(xs)]) / W, 0, 1) * (cols - 1)
+        cy = np.clip(np.array([min(ys), max(ys)]) / H, 0, 1) * (rows - 1)
+        r0, r1 = int(rows - 1 - cy[1]), int(np.ceil(rows - 1 - cy[0])) + 1
+        c0, c1 = int(cx[0]), int(np.ceil(cx[1])) + 1
+        block = z_mm[max(r0, 0):r1, max(c0, 0):c1]
+        return float(block.max()) if block.size else float(z_mm.max())
+
+    GROW = 0.04   # mm: grow each footprint so wall-to-wall neighbours overlap
+                  # slightly rather than share an exact face (a CSG degeneracy)
+
+    prisms, skipped = [], 0
+    for fp in footprints:
+        poly = [to_xy(lon, lat) for lon, lat in fp["coords"][:-1]]   # drop closing dup
+        # clamp wild vertices from buildings that straddle the bbox edge
+        poly = [(min(max(x, -3.0), W + 3.0), min(max(y, -3.0), H + 3.0))
+                for x, y in poly]
+        if simplify_mm > 0 and len(poly) > 4:
+            poly = _simplify(poly, simplify_mm)
+        poly = [p for i, p in enumerate(poly) if p != poly[i - 1]]  # drop repeats
+        if len(poly) < 3:
+            skipped += 1
+            continue
+        if _poly_area(poly) < 0:                # want CCW / positive for manifold3d
+            poly = poly[::-1]
+        if _poly_area(poly) < min_area_mm2:
+            skipped += 1
+            continue
+        # extrude from below the model base up to (highest terrain under the
+        # footprint + building height): the prism always spans the full terrain
+        # thickness so it can never float, and the roof clears the terrain.
+        h_mm = _building_height_m(fp["tags"], level_h, default_h) * mm_per_m * exaggeration
+        top = terrain_z_max_under(poly) + h_mm
+        try:
+            cs = m3d.CrossSection([poly]).offset(GROW, m3d.JoinType.Miter)
+            pr = cs.extrude(top + 1.0).translate([0.0, 0.0, -1.0])
+        except Exception:
+            skipped += 1
+            continue
+        if pr.is_empty() or pr.genus() != 0:   # self-intersecting / degenerate footprint
+            skipped += 1
+            continue
+        prisms.append(pr)
+
+    if not prisms:
+        print(f"  no usable footprints ({skipped} skipped)")
+        return np.asarray(base_tris, dtype=np.float32)
+
+    print(f"  extruding {len(prisms)} buildings ({skipped} skipped), "
+          f"union with terrain ...")
+    terrain = _soup_to_manifold(base_tris)
+    built = m3d.Manifold.batch_boolean(prisms, m3d.OpType.Add)   # merge blocks first
+    res = terrain + built
+    if res.is_empty():
+        raise SystemExit("building union produced an empty mesh")
+
+    # CSG on hundreds of prisms leaves a few zero-volume sliver shells; keep only
+    # the components with real volume and re-join them.
+    comps = [c for c in res.decompose() if c.volume() > 0.05]
+    if len(comps) > 1:
+        res = m3d.Manifold.batch_boolean(comps, m3d.OpType.Add)
+    elif comps:
+        res = comps[0]
+    return _manifold_to_soup(res)
+
+
 def _boolean_text(base_tris: list, boxes: list, op: str) -> np.ndarray:
     """base - text  (op='sub')  or  base + text  (op='add'), via manifold3d."""
     import manifold3d as m3d
 
-    soup = np.asarray(base_tris, dtype=np.float64).reshape(-1, 3)
-    uniq, inv = np.unique(np.round(soup, 6), axis=0, return_inverse=True)
-    base = m3d.Manifold(m3d.Mesh(
-        vert_properties=uniq.astype(np.float32),
-        tri_verts=inv.reshape(-1, 3).astype(np.uint32)))
+    base = _soup_to_manifold(base_tris)
     if base.is_empty():
         raise SystemExit("base mesh is not a valid solid for embossing")
 
@@ -602,18 +827,7 @@ def _boolean_text(base_tris: list, boxes: list, op: str) -> np.ndarray:
     res = (base - text) if op == "sub" else (base + text)
     if res.is_empty():
         raise SystemExit("emboss boolean produced an empty mesh")
-
-    mesh = res.to_mesh()
-    verts = np.asarray(mesh.vert_properties)[:, :3].astype(np.float32)
-    tv = np.asarray(mesh.tri_verts)
-    mf, mt = np.asarray(mesh.merge_from_vert), np.asarray(mesh.merge_to_vert)
-    if mf.size:                       # weld the verts manifold3d marks coincident
-        remap = np.arange(len(verts))
-        remap[mf] = mt
-        tv = remap[tv]
-    out = verts[tv]
-    n = np.cross(out[:, 1] - out[:, 0], out[:, 2] - out[:, 0])
-    return out[np.linalg.norm(n, axis=1) > 1e-7]   # drop CSG sliver triangles
+    return _manifold_to_soup(res)
 
 
 def _fmt_lat(lat: float, d: int) -> str:
@@ -708,16 +922,19 @@ def emboss_corner_coords(tris: list, info: dict, bbox, cap_mm: float,
 
 
 def data_attribution(source: str, ign_res: int | None = None,
-                     buildings: bool = False) -> tuple[str, str]:
+                     buildings: bool = False, osm: bool = False) -> tuple[str, str]:
     """(full credit line for the sidecar, ASCII short form for the 80-byte STL header)."""
+    osm_full = " · Building data © OpenStreetMap contributors (ODbL)" if osm else ""
+    osm_hdr = " + OSM" if osm else ""
     if source == "ign":
-        what = "Elevation & building data" if buildings else "Elevation data"
+        what = "Elevation & building data" if (buildings and not osm) else "Elevation data"
         return (f"{what} © Instituto Geográfico Nacional de España (CNIG) "
-                "— https://www.ign.es — CC-BY 4.0 compatible, attribution required",
-                "topo2stl | (c) IGN Espana / CNIG")
+                "— https://www.ign.es — CC-BY 4.0 compatible, attribution "
+                f"required{osm_full}",
+                f"topo2stl | (c) IGN Espana / CNIG{osm_hdr}")
     if source == "tessadem":
-        return ("Elevation data via the TessaDEM API — https://tessadem.com",
-                "topo2stl | Elevation via TessaDEM")
+        return (f"Elevation data via the TessaDEM API — https://tessadem.com{osm_full}",
+                f"topo2stl | Elevation via TessaDEM{osm_hdr}")
     return ("", "topo2stl")
 
 
@@ -791,20 +1008,31 @@ def parse_args(argv=None):
     p.add_argument("--unit", choices=["meters", "feet"], default="meters")
 
     p.add_argument("--buildings", action="store_true",
-                   help="add building massing from IGN LiDAR (Spain only) on "
-                        "top of the terrain - for neighbourhood / city-block "
-                        "scenes. Forces 5 m elevation data.")
-    p.add_argument("--building-source", choices=["surface", "classified"],
-                   default="surface",
-                   help="'surface' = full DSM minus terrain minus vegetation "
-                        "(complete, keeps some tree noise); 'classified' = IGN's "
-                        "building-class DSM (no trees, misses some monument roofs)")
+                   help="add building massing on top of the terrain - for "
+                        "neighbourhood / city-block scenes. Forces 5 m "
+                        "elevation data.")
+    p.add_argument("--building-source",
+                   choices=["osm", "raster", "raster-classified"], default="osm",
+                   help="'osm' = OpenStreetMap footprints extruded to crisp "
+                        "prisms (needs internet); 'raster' = IGN LiDAR surface "
+                        "minus terrain minus vegetation (blocky, ~5 m, offline "
+                        "once cached); 'raster-classified' = IGN building-class "
+                        "DSM (no trees, misses some monument roofs)")
     p.add_argument("--building-exaggeration", type=float, default=1.0,
                    help="vertical multiplier for buildings only (kept separate "
                         "from --z-exaggeration so massing stays true-scale)")
+    p.add_argument("--building-level-height", type=float, default=3.0,
+                   help="metres per floor when height comes from building:levels "
+                        "(osm)")
+    p.add_argument("--building-default-height", type=float, default=9.0,
+                   help="metres for an osm footprint with no height/levels tag")
+    p.add_argument("--building-min-area", type=float, default=10.0,
+                   help="drop osm footprints smaller than this many m^2")
+    p.add_argument("--building-simplify", type=float, default=0.4,
+                   help="osm footprint simplification tolerance, model mm")
     p.add_argument("--building-min-height", type=float, default=2.0,
-                   help="zero out building cells below this many metres (drops "
-                        "walls/sheds/noise)")
+                   help="raster only: zero out building cells below this many "
+                        "metres (drops walls/sheds/noise)")
 
     p.add_argument("--emboss-coords", action="store_true",
                    help="mark each side wall with its edge coordinate (latitude "
@@ -886,19 +1114,27 @@ def main(argv=None):
     if a.source == "tessadem" and a.unit == "feet":
         grid_m = grid_m * 0.3048      # mesh math is metric (IGN is always metres)
 
-    buildings_m = None
+    buildings_m = None                 # raster path: added inside build_mesh
+    osm_footprints = None              # osm path: unioned after build_mesh
     if a.buildings:
-        buildings_m = cached_buildings(bbox, rows, cols, a.building_source,
-                                       a.verbose, a.no_cache)
-        buildings_m = np.where(buildings_m < a.building_min_height, 0.0, buildings_m)
         mm_per_m = a.model_width / real_w
-        tallest_mm = float(buildings_m.max()) * mm_per_m * a.building_exaggeration
-        n = int((buildings_m > 0).sum())
-        print(f"Buildings ({a.building_source}): {n} cells, tallest "
-              f"{buildings_m.max():.0f} m -> {tallest_mm:.1f} mm on the model")
-        if tallest_mm < 0.6:
-            print("  ! at this area size / model width buildings print < 0.6 mm "
-                  "tall - use a tighter --bbox or a bigger --model-width")
+        if a.building_source == "osm":
+            osm_footprints = fetch_osm_buildings(bbox, a.verbose, a.no_cache)
+            print(f"Buildings (osm): {len(osm_footprints)} footprints")
+        else:
+            method = {"raster": "surface",
+                      "raster-classified": "classified"}[a.building_source]
+            buildings_m = cached_buildings(bbox, rows, cols, method,
+                                           a.verbose, a.no_cache)
+            buildings_m = np.where(buildings_m < a.building_min_height, 0.0,
+                                   buildings_m)
+            tallest_mm = float(buildings_m.max()) * mm_per_m * a.building_exaggeration
+            n = int((buildings_m > 0).sum())
+            print(f"Buildings ({a.building_source}): {n} cells, tallest "
+                  f"{buildings_m.max():.0f} m -> {tallest_mm:.1f} mm on the model")
+            if tallest_mm < 0.6:
+                print("  ! buildings print < 0.6 mm tall at this scale - "
+                      "tighter --bbox or bigger --model-width")
 
     # smooth the terrain (not the buildings) - post-download, cache untouched
     native_m = {5: 5.0, 25: 25.0}.get(a.ign_res, 25.0) if a.source == "ign" else 30.0
@@ -919,6 +1155,12 @@ def main(argv=None):
                             buildings_m=buildings_m,
                             building_exaggeration=a.building_exaggeration)
 
+    if osm_footprints is not None:
+        tris = add_osm_buildings(
+            tris, info, bbox, osm_footprints,
+            a.building_level_height, a.building_default_height,
+            a.building_exaggeration, a.building_min_area, a.building_simplify)
+
     if a.emboss_coords:
         tris = emboss_corner_coords(tris, info, bbox, a.emboss_height,
                                     a.emboss_depth, a.emboss_decimals,
@@ -928,7 +1170,9 @@ def main(argv=None):
 
     out = Path(a.output) if a.output else Path(
         f"topo_{min_lat:.3f}_{min_lon:.3f}_{rows}x{cols}.stl")
-    credit, stl_header = data_attribution(a.source, a.ign_res, a.buildings)
+    credit, stl_header = data_attribution(
+        a.source, a.ign_res, a.buildings,
+        osm=(a.buildings and a.building_source == "osm"))
     write_binary_stl(tris, out, stl_header)
     if credit:
         print(f"  attribution (required if published/sold): {credit}")
@@ -942,7 +1186,7 @@ def main(argv=None):
         "elev_m_per_mm": round(info["m_per_mm"], 4),   # for the viewer's contour lines
         "base_mm": a.base,
         "smooth": round(sigma, 2),
-        "buildings": (f"ign {a.building_source}" if a.buildings else None),
+        "buildings": (a.building_source if a.buildings else None),
         "building_exaggeration": (a.building_exaggeration if a.buildings else None),
         "generator": "topo2stl",
         "attribution": credit,

@@ -82,9 +82,11 @@ python topo2stl.py --bbox 36.98,-3.45,37.10,-3.28 --ign-res 5 \
 | `--smooth` | Gaussian-blur the elevation grid. `auto` (default) scales the blur to how far the data was up/downsampled — heavy for a small area on 25 m data, light otherwise; a number forces sigma in cells; `0` disables. Applied after download, cache untouched. |
 | `--base` | Solid mm beneath the lowest terrain point. |
 | `--sea-level` | Height measured from 0 m rather than the tile minimum. |
-| `--buildings` | Add building massing (IGN LiDAR, Spain) — see below. Forces 5 m elevation data. |
-| `--building-source` | `surface` (default) or `classified` — see below. |
-| `--building-exaggeration` / `--building-min-height` | Buildings-only height multiplier (default 1.0) and the metre threshold below which a cell is dropped (default 2). |
+| `--buildings` | Add building massing — see below. Forces 5 m elevation data. |
+| `--building-source` | `osm` (default), `raster`, or `raster-classified` — see below. |
+| `--building-exaggeration` | Buildings-only height multiplier (default 1.0). |
+| `--building-level-height` / `--building-default-height` | osm: metres per floor (3.0) and fallback height for untagged footprints (9.0). |
+| `--building-min-area` / `--building-simplify` | osm: drop footprints under N m² (10); simplify tolerance in model mm (0.4). |
 | `--emboss-coords` | Engrave each side wall's edge coordinate (see below). |
 | `--emboss-style` | `engraved` (cut in, default — needs `manifold3d`) or `raised` (stands proud). |
 | `--emboss-height` / `--emboss-depth` | Text cap height (mm, default 4) and engraving/relief depth (mm, default 0.6). |
@@ -120,29 +122,30 @@ ignore it.
 
 ---
 
-## Buildings (Spain)
+## Buildings
 
 `--buildings` adds building massing on top of the terrain, for
 neighbourhood / city-block scenes:
 
 ```bash
-python topo2stl.py --center 37.8790,-4.7794 --width-km 0.8 \
-  --grid 300 --model-width 180 --z-exaggeration 1.2 --base 4 --buildings \
+python topo2stl.py --center 37.8790,-4.7794 --width-km 0.7 \
+  --grid 280 --model-width 180 --z-exaggeration 1.15 --base 4 --buildings \
   -o mezquita.stl --view
 ```
 
-It fetches IGN LiDAR for the same area and grid and adds each cell's
-height-above-ground to the surface — 2.5–5 m blocky, following rooflines, like a
-physical city model. Cached like the elevation grid.
-
 **`--building-source`:**
 
-- `surface` *(default)* — full surface model minus bald earth minus classified
-  vegetation (`mds05 − mdt05 − mdsn_v025`). Captures **everything**, including
-  monument roofs the LiDAR building-classifier misses (the Mezquita's hypostyle
-  hall is a case in point). Leaves a little tree noise in leafy districts.
-- `classified` — IGN's normalised DSM building class directly. No trees, but
-  drops some large low / monument roofs.
+- `osm` *(default)* — OpenStreetMap footprints extruded to crisp flat-top
+  prisms, seated on the terrain and unioned in (`manifold3d`). Sharp walls and
+  corners, buildings stay separate. Height per building from the `height` tag,
+  else `building:levels × --building-level-height` (3 m), else
+  `--building-default-height`. Needs internet (Overpass); the response is
+  cached. Roof shape is lost (everything's flat-topped).
+- `raster` — IGN LiDAR surface model minus bald earth minus vegetation
+  (`mds05 − mdt05 − mdsn_v025`), added to the grid. Blocky at ~5 m but captures
+  rooflines and domes, and works offline once cached. Spain only.
+- `raster-classified` — IGN's building-class DSM directly. No trees, but drops
+  some large low / monument roofs.
 
 Notes:
 
@@ -151,8 +154,8 @@ Notes:
 - Keep the area small: `--width-km` of 0.3–2 km. The tool warns if the model
   scale makes buildings print under 0.6 mm.
 - Best with a low `--z-exaggeration` (1–1.5) and a slightly thicker `--base`.
-- Spain only. `--buildings` with `--source tessadem` is an error, and it forces
-  5 m elevation data so the buildings sit on crisp terrain.
+- Forces 5 m elevation data so buildings sit on crisp terrain. The `raster`
+  sources are Spain only; `osm` works anywhere OSM has footprints.
 
 ---
 

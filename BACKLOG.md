@@ -6,10 +6,15 @@ Loose list of things to do, roughly in priority order.
 
 - **Buildings and monuments** — scoped in
   [docs/buildings-scope.md](docs/buildings-scope.md).
-  - [x] Strategy A: `--buildings` — IGN LiDAR building heights (mds05 − mdt05 −
-    veg by default) added to the terrain surface (Spain, neighbourhood scale).
-    `--smooth auto` on by default to de-block the upsampled terrain.
-  - [ ] Strategy B: OSM / Catastro vector footprints for crisp edges.
+  - [x] Strategy A: `--building-source raster` — IGN LiDAR heights added to the
+    terrain grid. `--smooth auto` on by default to de-block the terrain.
+  - [x] Strategy B: `--building-source osm` (now the default) — OSM footprints
+    extruded to prisms via manifold3d, unioned onto the terrain. Crisp walls,
+    per-building heights from `building:levels`.
+  - [ ] B polish: courtyard footprints (OSM multipolygon relations, currently
+    skipped); a few non-manifold edges survive the union at exact precision
+    (slicer-repairable, but chase it); optional gabled roofs from `roof:shape`.
+  - [ ] Catastro footprints (100% Spain coverage + floor counts, needs UTM).
   - [ ] `--landmark "lat,lon,file.stl"` — drop a custom monument mesh.
   - [ ] Water mask — recess rivers/coast as a channel (Micropolitan style).
 - **viewer.py lifecycle** — `--view` starts the server detached
