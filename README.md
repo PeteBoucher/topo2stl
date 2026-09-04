@@ -139,7 +139,8 @@ python topo2stl.py --center 37.8790,-4.7794 --width-km 0.7 \
 - `osm` *(default)* — OpenStreetMap footprints (ways **and** multipolygon
   relations, so courtyard buildings like the Mezquita come through with their
   patio as a hole) extruded to crisp flat-top prisms, seated on the terrain and
-  unioned in (`manifold3d`). Height per building from the `height` tag, else
+  unioned in (`manifold3d`). Footprints are clipped to the base plate so nothing
+  overhangs. Height per building from the `height` tag, else
   `building:levels × --building-level-height` (3 m), else 14 m for churches /
   mosques / monasteries with no other data, else `--building-default-height`.
   Needs internet (Overpass); the response is cached. Roof shape is flat.
@@ -152,7 +153,8 @@ python topo2stl.py --center 37.8790,-4.7794 --width-km 0.7 \
 **`--trees`** overlays tree canopy from IGN's vegetation-class DSM (`mdsn_v025`,
 2.5 m, Spain) — parks, riverbanks, tree-lined streets show as low bumpy mounds.
 Works with any `--building-source` or on its own. `--tree-exaggeration`,
-`--tree-min-height` to tune.
+`--tree-min-height` to tune. The canopy (and raster buildings) is masked out
+over OSM water so bridges and boats don't turn into a line of trees.
 
 ```bash
 python topo2stl.py --center 37.8785,-4.7790 --width-km 0.8 \

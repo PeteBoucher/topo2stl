@@ -362,30 +362,32 @@ def _stitch_rings(ways: list) -> list:
     return rings
 
 
-def fetch_osm_buildings(bbox, verbose, no_cache) -> list:
-    """List of {'outer': [(lon,lat)...], 'holes': [[...], ...], 'tags': {...}}
-    for every OSM building (ways and multipolygon relations) in the bbox.
-    Cached as raw Overpass JSON."""
+def fetch_osm(bbox, verbose, no_cache) -> tuple[list, list]:
+    """(buildings, water). buildings: {'outer','holes','tags'} for every OSM
+    building (ways + multipolygon relations). water: list of (lon,lat) rings for
+    lakes/rivers. Cached as raw Overpass JSON."""
     if requests is None:
         raise RuntimeError("The 'requests' package is required.")
     CACHE_DIR.mkdir(exist_ok=True)
     min_lat, min_lon, max_lat, max_lon = bbox
-    sig = f"{CACHE_VERSION}|mp2|{min_lat:.6f},{min_lon:.6f},{max_lat:.6f},{max_lon:.6f}"
+    sig = f"{CACHE_VERSION}|mpw|{min_lat:.6f},{min_lon:.6f},{max_lat:.6f},{max_lon:.6f}"
     path = CACHE_DIR / f"osm_v{CACHE_VERSION}_{hashlib.sha1(sig.encode()).hexdigest()[:16]}.json"
 
     if path.exists() and not no_cache:
-        print(f"Using cached OSM buildings: {path.name}")
+        print(f"Using cached OSM data: {path.name}")
         data = json.loads(path.read_text())
     else:
         b = f"{min_lat},{min_lon},{max_lat},{max_lon}"
-        q = (f"[out:json][timeout:90];"
-             f'(way["building"]({b});relation["building"]["type"="multipolygon"]({b}););'
-             f"out geom;")
+        q = (f"[out:json][timeout:90];("
+             f'way["building"]({b});relation["building"]["type"="multipolygon"]({b});'
+             f'way["natural"="water"]({b});relation["natural"="water"]({b});'
+             f'way["waterway"="riverbank"]({b});'
+             f");out geom;")
         headers = {"User-Agent": "topo2stl/1.0 (+https://github.com/PeteBoucher/topo2stl)"}
         data = None
         for ep in OVERPASS_ENDPOINTS:
             try:
-                print(f"Querying Overpass ({ep.split('/')[2]}) for buildings ...")
+                print(f"Querying Overpass ({ep.split('/')[2]}) ...")
                 r = requests.post(ep, data={"data": q}, headers=headers, timeout=120)
                 if r.status_code == 200 and r.content[:1] == b"{":
                     data = r.json()
@@ -397,29 +399,42 @@ def fetch_osm_buildings(bbox, verbose, no_cache) -> list:
             raise SystemExit("Overpass unavailable - try again later, or use "
                              "--building-source raster")
         path.write_text(json.dumps(data))
-        print(f"Cached OSM buildings -> {path.name}")
+        print(f"Cached OSM data -> {path.name}")
 
-    out, rels = [], 0
+    def rel_rings(el):
+        outers = [[(p["lon"], p["lat"]) for p in m["geometry"]]
+                  for m in el.get("members", [])
+                  if m.get("role") in ("outer", "") and m.get("geometry")]
+        inners = [[(p["lon"], p["lat"]) for p in m["geometry"]]
+                  for m in el.get("members", [])
+                  if m.get("role") == "inner" and m.get("geometry")
+                  and len(m["geometry"]) >= 4]
+        return _stitch_rings(outers), inners
+
+    buildings, water, rels = [], [], 0
     for el in data.get("elements", []):
         tags = el.get("tags", {})
+        is_water = tags.get("natural") == "water" or tags.get("waterway") == "riverbank"
         if el.get("type") == "way" and "geometry" in el:
             pts = [(p["lon"], p["lat"]) for p in el["geometry"]]
-            if len(pts) >= 4:
-                out.append({"outer": pts, "holes": [], "tags": tags})
-        elif el.get("type") == "relation" and el.get("tags", {}).get("type") == "multipolygon":
-            outers = [[(p["lon"], p["lat"]) for p in m["geometry"]]
-                      for m in el.get("members", [])
-                      if m.get("role") == "outer" and m.get("geometry")]
-            inners = [[(p["lon"], p["lat"]) for p in m["geometry"]]
-                      for m in el.get("members", [])
-                      if m.get("role") == "inner" and m.get("geometry")
-                      and len(m["geometry"]) >= 4]
-            for ring in _stitch_rings(outers):
-                out.append({"outer": ring, "holes": inners, "tags": tags})
-                rels += 1
+            if len(pts) < 4:
+                continue
+            if is_water:
+                water.append(pts)
+            elif "building" in tags:
+                buildings.append({"outer": pts, "holes": [], "tags": tags})
+        elif el.get("type") == "relation" and tags.get("type") == "multipolygon":
+            outers, inners = rel_rings(el)
+            for ring in outers:
+                if is_water:
+                    water.append(ring)
+                elif "building" in tags:
+                    buildings.append({"outer": ring, "holes": inners, "tags": tags})
+                    rels += 1
     if verbose:
-        print(f"  {len(out)} footprints ({rels} from multipolygon relations)")
-    return out
+        print(f"  {len(buildings)} footprints ({rels} from relations), "
+              f"{len(water)} water polygons")
+    return buildings, water
 
 
 _TALL_BUILDING_TYPES = {"church", "cathedral", "basilica", "chapel", "mosque",
@@ -471,6 +486,55 @@ def _simplify(pts, tol):
     if dmax <= tol:
         return [pts[0], pts[-1]]
     return _simplify(pts[:idx + 1], tol)[:-1] + _simplify(pts[idx:], tol)
+
+
+def _clip_rect(poly, x0, y0, x1, y1):
+    """Sutherland-Hodgman clip of a polygon to an axis-aligned rectangle."""
+    def clip(pts, keep, cut):
+        out = []
+        for i in range(len(pts)):
+            a, b = pts[i - 1], pts[i]
+            ka, kb = keep(a), keep(b)
+            if kb:
+                if not ka:
+                    out.append(cut(a, b))
+                out.append(b)
+            elif ka:
+                out.append(cut(a, b))
+        return out
+
+    p = list(poly)
+    p = clip(p, lambda q: q[0] >= x0,
+             lambda a, b: (x0, a[1] + (b[1] - a[1]) * (x0 - a[0]) / (b[0] - a[0])))
+    p = clip(p, lambda q: q[0] <= x1,
+             lambda a, b: (x1, a[1] + (b[1] - a[1]) * (x1 - a[0]) / (b[0] - a[0]))) if p else p
+    p = clip(p, lambda q: q[1] >= y0,
+             lambda a, b: (a[0] + (b[0] - a[0]) * (y0 - a[1]) / (b[1] - a[1]), y0)) if p else p
+    p = clip(p, lambda q: q[1] <= y1,
+             lambda a, b: (a[0] + (b[0] - a[0]) * (y1 - a[1]) / (b[1] - a[1]), y1)) if p else p
+    return p
+
+
+def _rasterize_polys(polys, rows, cols, W, H):
+    """Boolean (rows, cols) mask (row 0 = north) of cells whose centre falls
+    inside any polygon. polys are model-mm (x east, y north)."""
+    cx = (np.arange(cols)) / max(cols - 1, 1) * W
+    cy = (1.0 - np.arange(rows) / max(rows - 1, 1)) * H       # row 0 = north
+    X, Y = np.meshgrid(cx, cy)
+    mask = np.zeros((rows, cols), bool)
+    for poly in polys:
+        p = np.asarray(poly, float)
+        if len(p) < 3:
+            continue
+        inside = np.zeros_like(X, bool)
+        xj, yj = p[-1]
+        for xi, yi in p:
+            cond = ((yi > Y) != (yj > Y)) & \
+                   (X < (xj - xi) * (Y - yi) / (yj - yi + 1e-12) + xi)
+            inside ^= cond
+            xj, yj = xi, yi
+        mask |= inside
+    return mask
 
 
 # --------------------------------------------------------------------------- #
@@ -828,9 +892,11 @@ def add_osm_buildings(base_tris: list, info: dict, bbox, footprints: list,
     GROW = 0.04   # mm: grow each footprint so wall-to-wall neighbours overlap
                   # slightly rather than share an exact face (a CSG degeneracy)
 
+    M = 0.1   # keep footprints just inside the base plate so nothing overhangs
+
     def prep_ring(coords, want_ccw):
         r = [to_xy(lon, lat) for lon, lat in coords[:-1]]     # drop closing dup
-        r = [(min(max(x, -3.0), W + 3.0), min(max(y, -3.0), H + 3.0)) for x, y in r]
+        r = _clip_rect(r, M, M, W - M, H - M)                 # trim to the base
         if simplify_mm > 0 and len(r) > 4:
             r = _simplify(r, simplify_mm)
         r = [p for i, p in enumerate(r) if p != r[i - 1]]     # drop repeats
@@ -1213,18 +1279,22 @@ def main(argv=None):
         grid_m = grid_m * 0.3048      # mesh math is metric (IGN is always metres)
 
     mm_per_m = a.model_width / real_w
+    model_h_mm = (max_lat - min_lat) * EARTH_M_PER_DEG_LAT * mm_per_m
     overlay_m = None                   # raster buildings + trees: added in build_mesh
     osm_footprints = None              # osm buildings: unioned after build_mesh
+    osm_water = []
 
     def add_overlay(layer, exag):
         nonlocal overlay_m
         layer = layer * exag
         overlay_m = layer if overlay_m is None else overlay_m + layer
 
-    if a.buildings and a.building_source == "osm":
-        osm_footprints = fetch_osm_buildings(bbox, a.verbose, a.no_cache)
-        print(f"Buildings (osm): {len(osm_footprints)} footprints")
-    elif a.buildings:
+    if (a.buildings and a.building_source == "osm") or a.trees:
+        b, osm_water = fetch_osm(bbox, a.verbose, a.no_cache)
+        if a.buildings and a.building_source == "osm":
+            osm_footprints = b
+            print(f"Buildings (osm): {len(osm_footprints)} footprints")
+    if a.buildings and a.building_source != "osm":
         method = {"raster": "surface",
                   "raster-classified": "classified"}[a.building_source]
         b = cached_buildings(bbox, rows, cols, method, a.verbose, a.no_cache)
@@ -1241,6 +1311,16 @@ def main(argv=None):
         v = np.where(v < a.tree_min_height, 0.0, v)
         add_overlay(v, a.tree_exaggeration)
         print(f"Trees: {int((v > 0).sum())} canopy cells, tallest {v.max():.0f} m")
+
+    if overlay_m is not None and osm_water:
+        polys_mm = [[((lon - min_lon) / (max_lon - min_lon) * a.model_width,
+                      (lat - min_lat) / (max_lat - min_lat) * model_h_mm)
+                     for lon, lat in ring] for ring in osm_water]
+        wet = _rasterize_polys(polys_mm, rows, cols, a.model_width, model_h_mm)
+        if wet.any():
+            overlay_m = np.where(wet, 0.0, overlay_m)
+            print(f"  masked overlay over {int(wet.sum())} water cells "
+                  f"(bridges, boats)")
 
     # smooth the terrain (not the buildings) - post-download, cache untouched
     native_m = {5: 5.0, 25: 25.0}.get(a.ign_res, 25.0) if a.source == "ign" else 30.0

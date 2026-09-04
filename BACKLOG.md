@@ -15,6 +15,8 @@ Loose list of things to do, roughly in priority order.
     holes; monument height fallback (14 m for churches/mosques); bogus
     `height=0.1` tags ignored.
   - [x] `--trees` — IGN vegetation DSM overlaid as canopy mounds (Spain).
+  - [x] OSM footprints clipped to the base plate (no overhang); canopy /
+    raster buildings masked over OSM water (no tree-line on the Puente Romano).
   - [ ] B polish: a few non-manifold edges survive the union at exact precision
     (slicer-repairable, but chase it); optional gabled roofs from `roof:shape`;
     OSM buildings currently seat on terrain+tree overlay (minor, buildings on
