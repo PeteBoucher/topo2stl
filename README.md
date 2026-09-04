@@ -79,10 +79,11 @@ python topo2stl.py --bbox 36.98,-3.45,37.10,-3.28 --ign-res 5 \
 | `--grid N` / `--grid ROWSxCOLS` | Output sampling. `N` auto-picks rows/cols from the area's real aspect ratio. ~`300` ≈ 180k triangles ≈ 9 MB STL. |
 | `--model-width` | Printed width in mm (E–W). Depth and height follow to true scale. |
 | `--z-exaggeration` | Vertical multiplier. `1.0` = true scale (usually too flat). `1.5`–`3` for mountains, more for lowlands. |
-| `--smooth` | Gaussian-blur the elevation grid, sigma in cells. `~1` cleans the fine resampling weave that shows up on large areas / high exaggeration. Applied after download — the cache is untouched, so trying values is instant. |
+| `--smooth` | Gaussian-blur the elevation grid. `auto` (default) scales the blur to how far the data was up/downsampled — heavy for a small area on 25 m data, light otherwise; a number forces sigma in cells; `0` disables. Applied after download, cache untouched. |
 | `--base` | Solid mm beneath the lowest terrain point. |
 | `--sea-level` | Height measured from 0 m rather than the tile minimum. |
-| `--buildings` | Add building massing (IGN MDSn, Spain) — see below. |
+| `--buildings` | Add building massing (IGN LiDAR, Spain) — see below. Forces 5 m elevation data. |
+| `--building-source` | `surface` (default) or `classified` — see below. |
 | `--building-exaggeration` / `--building-min-height` | Buildings-only height multiplier (default 1.0) and the metre threshold below which a cell is dropped (default 2). |
 | `--emboss-coords` | Engrave each side wall's edge coordinate (see below). |
 | `--emboss-style` | `engraved` (cut in, default — needs `manifold3d`) or `raised` (stands proud). |
@@ -130,18 +131,28 @@ python topo2stl.py --center 37.8790,-4.7794 --width-km 0.8 \
   -o mezquita.stl --view
 ```
 
-It fetches IGN's **normalised DSM, building class** (MDSn, 2.5 m) for the same
-area and grid, and adds each cell's height-above-ground to the surface. Blocky
-at 2.5 m, following rooflines — reads like a physical city model. Cached like
-the elevation grid.
+It fetches IGN LiDAR for the same area and grid and adds each cell's
+height-above-ground to the surface — 2.5–5 m blocky, following rooflines, like a
+physical city model. Cached like the elevation grid.
 
-- Building height is **not** touched by `--z-exaggeration` (that would turn the
-  skyline into a bar chart); use `--building-exaggeration` if you want to push it.
+**`--building-source`:**
+
+- `surface` *(default)* — full surface model minus bald earth minus classified
+  vegetation (`mds05 − mdt05 − mdsn_v025`). Captures **everything**, including
+  monument roofs the LiDAR building-classifier misses (the Mezquita's hypostyle
+  hall is a case in point). Leaves a little tree noise in leafy districts.
+- `classified` — IGN's normalised DSM building class directly. No trees, but
+  drops some large low / monument roofs.
+
+Notes:
+
+- Building height is **not** touched by `--z-exaggeration` (that would make the
+  skyline a bar chart); use `--building-exaggeration` to push it.
 - Keep the area small: `--width-km` of 0.3–2 km. The tool warns if the model
   scale makes buildings print under 0.6 mm.
-- Best with a low `--z-exaggeration` (1–1.5) so the terrain doesn't dwarf the
-  buildings, and a slightly thicker `--base`.
-- Spain only (it's IGN data). `--buildings` with `--source tessadem` is an error.
+- Best with a low `--z-exaggeration` (1–1.5) and a slightly thicker `--base`.
+- Spain only. `--buildings` with `--source tessadem` is an error, and it forces
+  5 m elevation data so the buildings sit on crisp terrain.
 
 ---
 

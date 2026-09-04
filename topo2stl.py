@@ -48,6 +48,8 @@ EARTH_M_PER_DEG_LAT = 111_320.0
 IGN_WCS_URL = "https://servicios.idee.es/wcs-inspire/mdt"
 IGN_COVERAGE = {5: "Elevacion4258_5", 25: "Elevacion4258_25"}
 IGN_MDS_URL = "https://wcs-mds.idee.es/mds"
+IGN_MDS_SURFACE = "mds05"          # full digital surface model, 5 m
+IGN_MDS_VEG = "mdsn_v025"          # normalised DSM, vegetation class, 2.5 m
 IGN_MDS_BUILDINGS = "mdsn_e025"    # normalised DSM, building class, 2.5 m
 EPSG_4326_URI = "http://www.opengis.net/def/crs/EPSG/0/4326"
 
@@ -275,15 +277,37 @@ def download_grid_ign(bbox, rows, cols, ign_res, verbose) -> np.ndarray:
     return grid
 
 
-def download_buildings_ign(bbox, rows, cols, verbose) -> np.ndarray:
-    """Building heights above ground (m) from IGN's normalised DSM, building
-    class (MDSn, 2.5 m). 0 where there is no building."""
-    print(f"Downloading {rows}x{cols} building-height grid from IGN MDSn "
-          f"({IGN_MDS_BUILDINGS}) ...")
-    grid = _fetch_ign_wcs(IGN_MDS_URL, IGN_MDS_BUILDINGS, bbox, rows, cols,
-                          verbose, subsetting_crs=EPSG_4326_URI)
-    grid = np.where(np.isnan(grid) | (grid < 0), 0.0, grid)
-    return grid
+def download_buildings_ign(bbox, rows, cols, method, verbose) -> np.ndarray:
+    """
+    Building height above ground (m), 0 where there is nothing.
+
+    method 'surface' (default): full surface model minus bald-earth minus
+        classified vegetation = every built structure, complete even where the
+        LiDAR building-classifier missed a roof (e.g. the Mezquita). Keeps a
+        little tree noise in leafy areas.
+    method 'classified': IGN's normalised DSM building class directly — excludes
+        trees but drops some monument / large low roofs.
+    """
+    def mds(cov):
+        return _fetch_ign_wcs(IGN_MDS_URL, cov, bbox, rows, cols, verbose,
+                              subsetting_crs=EPSG_4326_URI)
+
+    if method == "classified":
+        print(f"Downloading {rows}x{cols} building grid from IGN MDSn "
+              f"({IGN_MDS_BUILDINGS}) ...")
+        g = mds(IGN_MDS_BUILDINGS)
+        return np.where(np.isnan(g) | (g < 0), 0.0, g)
+
+    print(f"Downloading {rows}x{cols} building grid from IGN "
+          f"(mds05 - mdt05 - vegetation) ...")
+    surf = mds(IGN_MDS_SURFACE)
+    terr = _fetch_ign_wcs(IGN_WCS_URL, IGN_COVERAGE[5], bbox, rows, cols, verbose)
+    veg = mds(IGN_MDS_VEG)
+    h = surf - terr
+    h = np.where(np.isnan(h), 0.0, h)
+    veg = np.where(np.isnan(veg) | (veg < 0), 0.0, veg)
+    h = np.clip(h - veg, 0.0, None)
+    return gaussian_blur(h, 0.6)          # de-stair the upsampled edges a touch
 
 
 # --------------------------------------------------------------------------- #
@@ -321,18 +345,18 @@ def cached_grid(source, key, bbox, rows, cols, unit, ign_res,
     return grid
 
 
-def cached_buildings(bbox, rows, cols, verbose, no_cache) -> np.ndarray:
-    """Building-height grid (m) from IGN MDSn, cached like the elevation grid."""
+def cached_buildings(bbox, rows, cols, method, verbose, no_cache) -> np.ndarray:
+    """Building-height grid (m) from IGN, cached like the elevation grid."""
     CACHE_DIR.mkdir(exist_ok=True)
-    sig = json.dumps({"v": CACHE_VERSION, "kind": "mdsn_e025",
+    sig = json.dumps({"v": CACHE_VERSION, "kind": "buildings", "method": method,
                       "bbox": [round(b, 6) for b in bbox],
                       "rows": rows, "cols": cols}, sort_keys=True)
     h = hashlib.sha1(sig.encode()).hexdigest()[:16]
-    path = CACHE_DIR / f"buildings_v{CACHE_VERSION}_{rows}x{cols}_{h}.npy"
+    path = CACHE_DIR / f"buildings_{method}_v{CACHE_VERSION}_{rows}x{cols}_{h}.npy"
     if path.exists() and not no_cache:
         print(f"Using cached building grid: {path.name}")
         return np.load(path)
-    grid = download_buildings_ign(bbox, rows, cols, verbose)
+    grid = download_buildings_ign(bbox, rows, cols, method, verbose)
     np.save(path, grid)
     print(f"Cached building grid -> {path.name}")
     return grid
@@ -754,10 +778,11 @@ def parse_args(argv=None):
                    help="printed model width in mm (E-W)")
     p.add_argument("--z-exaggeration", type=float, default=1.5,
                    help="vertical scale multiplier vs true scale")
-    p.add_argument("--smooth", type=float, default=0.0,
-                   help="Gaussian blur the elevation grid, sigma in cells "
-                        "(~0.8-1.5 removes server-resampling weave on large "
-                        "areas; applied after download, cache is untouched)")
+    p.add_argument("--smooth", default="auto",
+                   help="Gaussian blur the elevation grid: 'auto' (default) "
+                        "picks a sigma from how far the data is up/downsampled; "
+                        "a number forces sigma in cells; '0' disables. Applied "
+                        "after download - the cache is untouched.")
     p.add_argument("--base", type=float, default=3.0,
                    help="solid base thickness in mm below the lowest terrain point")
     p.add_argument("--sea-level", action="store_true",
@@ -766,9 +791,14 @@ def parse_args(argv=None):
     p.add_argument("--unit", choices=["meters", "feet"], default="meters")
 
     p.add_argument("--buildings", action="store_true",
-                   help="add building massing from IGN's normalised DSM (MDSn, "
-                        "2.5 m, Spain only) on top of the terrain - for "
-                        "neighbourhood / city-block scenes")
+                   help="add building massing from IGN LiDAR (Spain only) on "
+                        "top of the terrain - for neighbourhood / city-block "
+                        "scenes. Forces 5 m elevation data.")
+    p.add_argument("--building-source", choices=["surface", "classified"],
+                   default="surface",
+                   help="'surface' = full DSM minus terrain minus vegetation "
+                        "(complete, keeps some tree noise); 'classified' = IGN's "
+                        "building-class DSM (no trees, misses some monument roofs)")
     p.add_argument("--building-exaggeration", type=float, default=1.0,
                    help="vertical multiplier for buildings only (kept separate "
                         "from --z-exaggeration so massing stays true-scale)")
@@ -838,6 +868,15 @@ def main(argv=None):
     if rows < 2 or cols < 2:
         raise SystemExit("grid must be at least 2x2")
 
+    mean_lat = (min_lat + max_lat) / 2
+    real_w = (max_lon - min_lon) * m_per_deg_lon(mean_lat)
+
+    if a.buildings and a.source != "ign":
+        raise SystemExit("--buildings uses IGN data; only works with --source ign")
+    if a.buildings and a.ign_res != 5:
+        a.ign_res = 5                  # buildings need crisp terrain to sit on
+        print("Buildings: using 5 m elevation data (MDT05)")
+
     print(f"BBox: {min_lat:.5f},{min_lon:.5f} -> {max_lat:.5f},{max_lon:.5f}")
     print(f"Grid: {rows} rows x {cols} cols")
 
@@ -847,26 +886,33 @@ def main(argv=None):
     if a.source == "tessadem" and a.unit == "feet":
         grid_m = grid_m * 0.3048      # mesh math is metric (IGN is always metres)
 
-    if a.smooth > 0:                   # post-download; does not touch the cache
-        grid_m = gaussian_blur(grid_m, a.smooth)
-        print(f"Smoothed grid (sigma {a.smooth} cells)")
-
     buildings_m = None
     if a.buildings:
-        if a.source != "ign":
-            raise SystemExit("--buildings uses IGN data; only works with --source ign")
-        buildings_m = cached_buildings(bbox, rows, cols, a.verbose, a.no_cache)
+        buildings_m = cached_buildings(bbox, rows, cols, a.building_source,
+                                       a.verbose, a.no_cache)
         buildings_m = np.where(buildings_m < a.building_min_height, 0.0, buildings_m)
-        mean_lat = (min_lat + max_lat) / 2
-        real_w = (max_lon - min_lon) * m_per_deg_lon(mean_lat)
         mm_per_m = a.model_width / real_w
         tallest_mm = float(buildings_m.max()) * mm_per_m * a.building_exaggeration
         n = int((buildings_m > 0).sum())
-        print(f"Buildings: {n} cells, tallest {buildings_m.max():.0f} m "
-              f"-> {tallest_mm:.1f} mm on the model")
+        print(f"Buildings ({a.building_source}): {n} cells, tallest "
+              f"{buildings_m.max():.0f} m -> {tallest_mm:.1f} mm on the model")
         if tallest_mm < 0.6:
             print("  ! at this area size / model width buildings print < 0.6 mm "
                   "tall - use a tighter --bbox or a bigger --model-width")
+
+    # smooth the terrain (not the buildings) - post-download, cache untouched
+    native_m = {5: 5.0, 25: 25.0}.get(a.ign_res, 25.0) if a.source == "ign" else 30.0
+    if a.smooth == "auto":
+        # blur roughly to the native post spacing: heavier when the server
+        # upsampled a lot, a light floor otherwise (server-resampling weave)
+        sigma = min(4.0, max(0.8, 0.8 * native_m / (real_w / cols)))
+        smooth_label = f"{sigma:.1f} (auto)"
+    else:
+        sigma = float(a.smooth)
+        smooth_label = f"{sigma:.1f}"
+    if sigma > 0:
+        grid_m = gaussian_blur(grid_m, sigma)
+        print(f"Smoothed terrain (sigma {smooth_label} cells)")
 
     tris, info = build_mesh(grid_m, bbox, a.model_width, a.z_exaggeration,
                             a.base, a.sea_level,
@@ -895,8 +941,8 @@ def main(argv=None):
         "grid": [rows, cols],
         "elev_m_per_mm": round(info["m_per_mm"], 4),   # for the viewer's contour lines
         "base_mm": a.base,
-        "smooth": a.smooth,
-        "buildings": ("ign MDSn" if a.buildings else None),
+        "smooth": round(sigma, 2),
+        "buildings": (f"ign {a.building_source}" if a.buildings else None),
         "building_exaggeration": (a.building_exaggeration if a.buildings else None),
         "generator": "topo2stl",
         "attribution": credit,

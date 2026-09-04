@@ -46,9 +46,13 @@ extra param:
  &format=application/asc&SCALESIZE=Long(cols),Lat(rows)
 ```
 
-Test over central Córdoba (0.01° box): 45 % of cells are buildings, mean 9.6 m,
-max 28.6 m (Cathedral tower). Looks correct. Data © IGN/CNIG, same licence as
-the MDT — attribution already handled by `data_attribution()`.
+**Caveat found in testing:** `mdsn_e025` (LiDAR *building class*) drops large
+low / monument roofs — over the Mezquita it registered mean ~5 m where the raw
+surface is ~19 m above ground: the classifier didn't label the hypostyle-hall
+roof as "building". So the shipped default derives height from the **full**
+surface instead: `mds05 − mdt05 − mdsn_v025` (surface − bald earth − classified
+vegetation). Complete, keeps a little tree noise. `mdsn_e025` stays available as
+`--building-source classified`. Data © IGN/CNIG, attribution already handled.
 
 ### Building footprints — vector (for crisp edges / styling)
 

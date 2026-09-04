@@ -6,8 +6,9 @@ Loose list of things to do, roughly in priority order.
 
 - **Buildings and monuments** — scoped in
   [docs/buildings-scope.md](docs/buildings-scope.md).
-  - [x] Strategy A: `--buildings` — IGN MDSn building-height raster added to
-    the terrain surface (Spain, neighbourhood scale).
+  - [x] Strategy A: `--buildings` — IGN LiDAR building heights (mds05 − mdt05 −
+    veg by default) added to the terrain surface (Spain, neighbourhood scale).
+    `--smooth auto` on by default to de-block the upsampled terrain.
   - [ ] Strategy B: OSM / Catastro vector footprints for crisp edges.
   - [ ] `--landmark "lat,lon,file.stl"` — drop a custom monument mesh.
   - [ ] Water mask — recess rivers/coast as a channel (Micropolitan style).
