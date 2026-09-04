@@ -4,7 +4,13 @@ Loose list of things to do, roughly in priority order.
 
 ## Ideas
 
-- **Buildings and monuments** Explore the idea of obtaining 3d model information for buildings in cities to add to small scale maps in city centres.
+- **Buildings and monuments** — scoped in
+  [docs/buildings-scope.md](docs/buildings-scope.md).
+  - [x] Strategy A: `--buildings` — IGN MDSn building-height raster added to
+    the terrain surface (Spain, neighbourhood scale).
+  - [ ] Strategy B: OSM / Catastro vector footprints for crisp edges.
+  - [ ] `--landmark "lat,lon,file.stl"` — drop a custom monument mesh.
+  - [ ] Water mask — recess rivers/coast as a channel (Micropolitan style).
 - Optional hillshade / contour bake into the printed surface itself.
 - `--preset` shelf (e.g. `wall-tile`, `desk`, `keyring`) bundling size + base +
   exaggeration.

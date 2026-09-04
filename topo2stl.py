@@ -47,6 +47,9 @@ EARTH_M_PER_DEG_LAT = 111_320.0
 
 IGN_WCS_URL = "https://servicios.idee.es/wcs-inspire/mdt"
 IGN_COVERAGE = {5: "Elevacion4258_5", 25: "Elevacion4258_25"}
+IGN_MDS_URL = "https://wcs-mds.idee.es/mds"
+IGN_MDS_BUILDINGS = "mdsn_e025"    # normalised DSM, building class, 2.5 m
+EPSG_4326_URI = "http://www.opengis.net/def/crs/EPSG/0/4326"
 
 # Bump when the fetch/parse/resample pipeline changes in a way that alters the
 # stored grid — old cache files with a different version are ignored.
@@ -234,36 +237,52 @@ def _parse_asc(text: str) -> np.ndarray:
     return grid
 
 
-def download_grid_ign(bbox, rows, cols, ign_res, verbose) -> np.ndarray:
+def _fetch_ign_wcs(url, coverage, bbox, rows, cols, verbose,
+                   subsetting_crs=None) -> np.ndarray:
+    """One IGN INSPIRE WCS GetCoverage, resampled server-side to rows x cols.
+    Returns a float grid, row 0 = north, NaN where the coverage has no data."""
     if requests is None:
         raise RuntimeError("The 'requests' package is required. pip install -r requirements.txt")
     min_lat, min_lon, max_lat, max_lon = bbox
-    coverage = IGN_COVERAGE[ign_res]
     params = {
-        "service": "WCS",
-        "version": "2.0.1",
-        "request": "GetCoverage",
-        "coverageId": coverage,
-        "format": "application/asc",
+        "service": "WCS", "version": "2.0.1", "request": "GetCoverage",
+        "coverageId": coverage, "format": "application/asc",
         "subset": [f"Lat({min_lat:.8f},{max_lat:.8f})",
                    f"Long({min_lon:.8f},{max_lon:.8f})"],
         "SCALESIZE": f"Long({cols}),Lat({rows})",
     }
-    print(f"Downloading {rows}x{cols} grid from IGN MDT{ign_res:02d} "
-          f"({coverage}) ...")
+    if subsetting_crs:
+        params["subsettingCrs"] = subsetting_crs
     if verbose:
-        print(f"  GET {IGN_WCS_URL} {params}")
-    r = requests.get(IGN_WCS_URL, params=params, timeout=180)
+        print(f"  GET {url} {params}")
+    r = requests.get(url, params=params, timeout=180)
     if r.status_code != 200 or b"ExceptionReport" in r.content[:2000]:
         raise RuntimeError(f"IGN WCS error (HTTP {r.status_code}): {r.text[:500]}")
     grid = _parse_asc(_split_multipart_asc(r.content))
     if grid.shape != (rows, cols):
-        # server may clamp to coverage extent; accept and let caller see it
         print(f"  note: server returned {grid.shape}, requested {(rows, cols)}")
+    return grid
+
+
+def download_grid_ign(bbox, rows, cols, ign_res, verbose) -> np.ndarray:
+    coverage = IGN_COVERAGE[ign_res]
+    print(f"Downloading {rows}x{cols} grid from IGN MDT{ign_res:02d} ({coverage}) ...")
+    grid = _fetch_ign_wcs(IGN_WCS_URL, coverage, bbox, rows, cols, verbose)
     if np.isnan(grid).any():
         n = int(np.isnan(grid).sum())
         print(f"  warning: {n} nodata cells (outside MDT coverage?); filled with min")
         grid = np.where(np.isnan(grid), np.nanmin(grid), grid)
+    return grid
+
+
+def download_buildings_ign(bbox, rows, cols, verbose) -> np.ndarray:
+    """Building heights above ground (m) from IGN's normalised DSM, building
+    class (MDSn, 2.5 m). 0 where there is no building."""
+    print(f"Downloading {rows}x{cols} building-height grid from IGN MDSn "
+          f"({IGN_MDS_BUILDINGS}) ...")
+    grid = _fetch_ign_wcs(IGN_MDS_URL, IGN_MDS_BUILDINGS, bbox, rows, cols,
+                          verbose, subsetting_crs=EPSG_4326_URI)
+    grid = np.where(np.isnan(grid) | (grid < 0), 0.0, grid)
     return grid
 
 
@@ -302,6 +321,23 @@ def cached_grid(source, key, bbox, rows, cols, unit, ign_res,
     return grid
 
 
+def cached_buildings(bbox, rows, cols, verbose, no_cache) -> np.ndarray:
+    """Building-height grid (m) from IGN MDSn, cached like the elevation grid."""
+    CACHE_DIR.mkdir(exist_ok=True)
+    sig = json.dumps({"v": CACHE_VERSION, "kind": "mdsn_e025",
+                      "bbox": [round(b, 6) for b in bbox],
+                      "rows": rows, "cols": cols}, sort_keys=True)
+    h = hashlib.sha1(sig.encode()).hexdigest()[:16]
+    path = CACHE_DIR / f"buildings_v{CACHE_VERSION}_{rows}x{cols}_{h}.npy"
+    if path.exists() and not no_cache:
+        print(f"Using cached building grid: {path.name}")
+        return np.load(path)
+    grid = download_buildings_ign(bbox, rows, cols, verbose)
+    np.save(path, grid)
+    print(f"Cached building grid -> {path.name}")
+    return grid
+
+
 # --------------------------------------------------------------------------- #
 # Grid smoothing
 # --------------------------------------------------------------------------- #
@@ -331,9 +367,13 @@ def gaussian_blur(a: np.ndarray, sigma: float) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 def build_mesh(grid_m: np.ndarray, bbox, model_width_mm: float,
                z_exaggeration: float, base_mm: float,
-               z_from_sea_level: bool) -> np.ndarray:
+               z_from_sea_level: bool,
+               buildings_m: np.ndarray | None = None,
+               building_exaggeration: float = 1.0) -> np.ndarray:
     """
     grid_m: elevations in metres, [row0=north, col0=west].
+    buildings_m: optional building height-above-ground (m), same shape; added on
+        top of the terrain surface *after* z-exaggeration so it keeps true scale.
     Returns an (n_tri, 3, 3) float32 array of triangle vertices.
     """
     min_lat, min_lon, max_lat, max_lon = bbox
@@ -352,6 +392,9 @@ def build_mesh(grid_m: np.ndarray, bbox, model_width_mm: float,
     base_ref = 0.0 if z_from_sea_level else float(np.min(grid_m))
     z = (grid_m - base_ref) * mm_per_m * z_exaggeration
     z = z - z.min() + base_mm            # lift so lowest surface point sits at base_mm
+    terrain_top_mm = float(z.max())
+    if buildings_m is not None:          # true-scale (not z-exaggerated) massing
+        z = z + buildings_m * mm_per_m * building_exaggeration
 
     X, Y = np.meshgrid(xs, ys)           # (rows, cols)
     top = np.stack([X, Y, z], axis=-1)   # (rows, cols, 3)
@@ -400,7 +443,8 @@ def build_mesh(grid_m: np.ndarray, bbox, model_width_mm: float,
     print(f"  ground sampling: ~{real_w_m/ (cols-1):.0f} m/px E-W, "
           f"~{real_h_m/(rows-1):.0f} m/px N-S")
     print(f"  relief: {grid_m.max()-grid_m.min():.0f} m -> "
-          f"{z.max()-base_mm:.1f} mm  (exaggeration {z_exaggeration}x, base {base_mm} mm)")
+          f"{terrain_top_mm-base_mm:.1f} mm  (exaggeration {z_exaggeration}x, "
+          f"base {base_mm} mm)")
 
     info = {
         "model_w": model_width_mm,
@@ -639,13 +683,14 @@ def emboss_corner_coords(tris: list, info: dict, bbox, cap_mm: float,
     return np.asarray(tris, dtype=np.float32)
 
 
-def data_attribution(source: str, ign_res: int | None = None) -> tuple[str, str]:
+def data_attribution(source: str, ign_res: int | None = None,
+                     buildings: bool = False) -> tuple[str, str]:
     """(full credit line for the sidecar, ASCII short form for the 80-byte STL header)."""
     if source == "ign":
-        return ("Elevation data © Instituto Geográfico Nacional de "
-                "España (CNIG) — https://www.ign.es — CC-BY 4.0 "
-                "compatible, attribution required",
-                "topo2stl | Elevation (c) IGN Espana / CNIG")
+        what = "Elevation & building data" if buildings else "Elevation data"
+        return (f"{what} © Instituto Geográfico Nacional de España (CNIG) "
+                "— https://www.ign.es — CC-BY 4.0 compatible, attribution required",
+                "topo2stl | (c) IGN Espana / CNIG")
     if source == "tessadem":
         return ("Elevation data via the TessaDEM API — https://tessadem.com",
                 "topo2stl | Elevation via TessaDEM")
@@ -719,6 +764,17 @@ def parse_args(argv=None):
                    help="measure height from 0 m elevation instead of the "
                         "lowest point in the tile (keeps bathymetry/altitude honest)")
     p.add_argument("--unit", choices=["meters", "feet"], default="meters")
+
+    p.add_argument("--buildings", action="store_true",
+                   help="add building massing from IGN's normalised DSM (MDSn, "
+                        "2.5 m, Spain only) on top of the terrain - for "
+                        "neighbourhood / city-block scenes")
+    p.add_argument("--building-exaggeration", type=float, default=1.0,
+                   help="vertical multiplier for buildings only (kept separate "
+                        "from --z-exaggeration so massing stays true-scale)")
+    p.add_argument("--building-min-height", type=float, default=2.0,
+                   help="zero out building cells below this many metres (drops "
+                        "walls/sheds/noise)")
 
     p.add_argument("--emboss-coords", action="store_true",
                    help="mark each side wall with its edge coordinate (latitude "
@@ -795,8 +851,27 @@ def main(argv=None):
         grid_m = gaussian_blur(grid_m, a.smooth)
         print(f"Smoothed grid (sigma {a.smooth} cells)")
 
+    buildings_m = None
+    if a.buildings:
+        if a.source != "ign":
+            raise SystemExit("--buildings uses IGN data; only works with --source ign")
+        buildings_m = cached_buildings(bbox, rows, cols, a.verbose, a.no_cache)
+        buildings_m = np.where(buildings_m < a.building_min_height, 0.0, buildings_m)
+        mean_lat = (min_lat + max_lat) / 2
+        real_w = (max_lon - min_lon) * m_per_deg_lon(mean_lat)
+        mm_per_m = a.model_width / real_w
+        tallest_mm = float(buildings_m.max()) * mm_per_m * a.building_exaggeration
+        n = int((buildings_m > 0).sum())
+        print(f"Buildings: {n} cells, tallest {buildings_m.max():.0f} m "
+              f"-> {tallest_mm:.1f} mm on the model")
+        if tallest_mm < 0.6:
+            print("  ! at this area size / model width buildings print < 0.6 mm "
+                  "tall - use a tighter --bbox or a bigger --model-width")
+
     tris, info = build_mesh(grid_m, bbox, a.model_width, a.z_exaggeration,
-                            a.base, a.sea_level)
+                            a.base, a.sea_level,
+                            buildings_m=buildings_m,
+                            building_exaggeration=a.building_exaggeration)
 
     if a.emboss_coords:
         tris = emboss_corner_coords(tris, info, bbox, a.emboss_height,
@@ -807,7 +882,7 @@ def main(argv=None):
 
     out = Path(a.output) if a.output else Path(
         f"topo_{min_lat:.3f}_{min_lon:.3f}_{rows}x{cols}.stl")
-    credit, stl_header = data_attribution(a.source, a.ign_res)
+    credit, stl_header = data_attribution(a.source, a.ign_res, a.buildings)
     write_binary_stl(tris, out, stl_header)
     if credit:
         print(f"  attribution (required if published/sold): {credit}")
@@ -821,6 +896,8 @@ def main(argv=None):
         "elev_m_per_mm": round(info["m_per_mm"], 4),   # for the viewer's contour lines
         "base_mm": a.base,
         "smooth": a.smooth,
+        "buildings": ("ign MDSn" if a.buildings else None),
+        "building_exaggeration": (a.building_exaggeration if a.buildings else None),
         "generator": "topo2stl",
         "attribution": credit,
     }

@@ -82,6 +82,8 @@ python topo2stl.py --bbox 36.98,-3.45,37.10,-3.28 --ign-res 5 \
 | `--smooth` | Gaussian-blur the elevation grid, sigma in cells. `~1` cleans the fine resampling weave that shows up on large areas / high exaggeration. Applied after download — the cache is untouched, so trying values is instant. |
 | `--base` | Solid mm beneath the lowest terrain point. |
 | `--sea-level` | Height measured from 0 m rather than the tile minimum. |
+| `--buildings` | Add building massing (IGN MDSn, Spain) — see below. |
+| `--building-exaggeration` / `--building-min-height` | Buildings-only height multiplier (default 1.0) and the metre threshold below which a cell is dropped (default 2). |
 | `--emboss-coords` | Engrave each side wall's edge coordinate (see below). |
 | `--emboss-style` | `engraved` (cut in, default — needs `manifold3d`) or `raised` (stands proud). |
 | `--emboss-height` / `--emboss-depth` | Text cap height (mm, default 4) and engraving/relief depth (mm, default 0.6). |
@@ -114,6 +116,32 @@ ignore it.
 
 > The viewer loads three.js from a CDN, so it needs an internet connection the
 > first time a browser caches it.
+
+---
+
+## Buildings (Spain)
+
+`--buildings` adds building massing on top of the terrain, for
+neighbourhood / city-block scenes:
+
+```bash
+python topo2stl.py --center 37.8790,-4.7794 --width-km 0.8 \
+  --grid 300 --model-width 180 --z-exaggeration 1.2 --base 4 --buildings \
+  -o mezquita.stl --view
+```
+
+It fetches IGN's **normalised DSM, building class** (MDSn, 2.5 m) for the same
+area and grid, and adds each cell's height-above-ground to the surface. Blocky
+at 2.5 m, following rooflines — reads like a physical city model. Cached like
+the elevation grid.
+
+- Building height is **not** touched by `--z-exaggeration` (that would turn the
+  skyline into a bar chart); use `--building-exaggeration` if you want to push it.
+- Keep the area small: `--width-km` of 0.3–2 km. The tool warns if the model
+  scale makes buildings print under 0.6 mm.
+- Best with a low `--z-exaggeration` (1–1.5) so the terrain doesn't dwarf the
+  buildings, and a slightly thicker `--base`.
+- Spain only (it's IGN data). `--buildings` with `--source tessadem` is an error.
 
 ---
 
