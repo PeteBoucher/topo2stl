@@ -15,7 +15,7 @@ model for free — but it works anywhere on Earth via a global fallback source.
 ## Quick start
 
 ```bash
-git clone https://github.com/petebouch/topo2stl.git
+git clone https://github.com/PeteBoucher/topo2stl.git
 cd topo2stl
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -87,6 +87,7 @@ python topo2stl.py --bbox 36.98,-3.45,37.10,-3.28 --ign-res 5 \
 | `--building-exaggeration` | Buildings-only height multiplier (default 1.0). |
 | `--building-level-height` / `--building-default-height` | osm: metres per floor (3.0) and fallback height for untagged footprints (9.0). |
 | `--building-min-area` / `--building-simplify` | osm: drop footprints under N m² (10); simplify tolerance in model mm (0.4). |
+| `--trees` | Add tree canopy from IGN's vegetation DSM (Spain). `--tree-exaggeration`, `--tree-min-height`. |
 | `--emboss-coords` | Engrave each side wall's edge coordinate (see below). |
 | `--emboss-style` | `engraved` (cut in, default — needs `manifold3d`) or `raised` (stands proud). |
 | `--emboss-height` / `--emboss-depth` | Text cap height (mm, default 4) and engraving/relief depth (mm, default 0.6). |
@@ -135,27 +136,40 @@ python topo2stl.py --center 37.8790,-4.7794 --width-km 0.7 \
 
 **`--building-source`:**
 
-- `osm` *(default)* — OpenStreetMap footprints extruded to crisp flat-top
-  prisms, seated on the terrain and unioned in (`manifold3d`). Sharp walls and
-  corners, buildings stay separate. Height per building from the `height` tag,
-  else `building:levels × --building-level-height` (3 m), else
-  `--building-default-height`. Needs internet (Overpass); the response is
-  cached. Roof shape is lost (everything's flat-topped).
+- `osm` *(default)* — OpenStreetMap footprints (ways **and** multipolygon
+  relations, so courtyard buildings like the Mezquita come through with their
+  patio as a hole) extruded to crisp flat-top prisms, seated on the terrain and
+  unioned in (`manifold3d`). Height per building from the `height` tag, else
+  `building:levels × --building-level-height` (3 m), else 14 m for churches /
+  mosques / monasteries with no other data, else `--building-default-height`.
+  Needs internet (Overpass); the response is cached. Roof shape is flat.
 - `raster` — IGN LiDAR surface model minus bald earth minus vegetation
   (`mds05 − mdt05 − mdsn_v025`), added to the grid. Blocky at ~5 m but captures
   rooflines and domes, and works offline once cached. Spain only.
 - `raster-classified` — IGN's building-class DSM directly. No trees, but drops
   some large low / monument roofs.
 
+**`--trees`** overlays tree canopy from IGN's vegetation-class DSM (`mdsn_v025`,
+2.5 m, Spain) — parks, riverbanks, tree-lined streets show as low bumpy mounds.
+Works with any `--building-source` or on its own. `--tree-exaggeration`,
+`--tree-min-height` to tune.
+
+```bash
+python topo2stl.py --center 37.8785,-4.7790 --width-km 0.8 \
+  --grid 300 --model-width 190 --z-exaggeration 1.15 --base 4 \
+  --buildings --trees -o mezquita.stl --view
+```
+
 Notes:
 
-- Building height is **not** touched by `--z-exaggeration` (that would make the
-  skyline a bar chart); use `--building-exaggeration` to push it.
+- Building / tree height is **not** touched by `--z-exaggeration` (that would
+  make the skyline a bar chart); use `--building-exaggeration` /
+  `--tree-exaggeration`.
 - Keep the area small: `--width-km` of 0.3–2 km. The tool warns if the model
   scale makes buildings print under 0.6 mm.
 - Best with a low `--z-exaggeration` (1–1.5) and a slightly thicker `--base`.
-- Forces 5 m elevation data so buildings sit on crisp terrain. The `raster`
-  sources are Spain only; `osm` works anywhere OSM has footprints.
+- `--buildings` / `--trees` force 5 m elevation data. The `raster` sources and
+  `--trees` are Spain only; `osm` buildings work anywhere OSM has footprints.
 
 ---
 

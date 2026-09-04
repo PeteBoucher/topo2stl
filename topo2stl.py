@@ -310,6 +310,17 @@ def download_buildings_ign(bbox, rows, cols, method, verbose) -> np.ndarray:
     return gaussian_blur(h, 0.6)          # de-stair the upsampled edges a touch
 
 
+def download_veg_ign(bbox, rows, cols, verbose) -> np.ndarray:
+    """Vegetation (tree canopy) height above ground, m, from IGN's normalised
+    DSM vegetation class (mdsn_v025, 2.5 m). 0 where there is no vegetation."""
+    print(f"Downloading {rows}x{cols} vegetation grid from IGN MDSn "
+          f"({IGN_MDS_VEG}) ...")
+    g = _fetch_ign_wcs(IGN_MDS_URL, IGN_MDS_VEG, bbox, rows, cols, verbose,
+                       subsetting_crs=EPSG_4326_URI)
+    g = np.where(np.isnan(g) | (g < 0), 0.0, g)
+    return gaussian_blur(g, 0.7)
+
+
 # --------------------------------------------------------------------------- #
 # OpenStreetMap building footprints (Overpass)
 # --------------------------------------------------------------------------- #
@@ -319,24 +330,58 @@ OVERPASS_ENDPOINTS = (
 )
 
 
+def _stitch_rings(ways: list) -> list:
+    """Chain a relation's outer/inner member ways into closed rings."""
+    rings, pending = [], []
+    for w in ways:
+        if len(w) >= 4 and w[0] == w[-1]:
+            rings.append(w)
+        elif len(w) >= 2:
+            pending.append(list(w))
+    while pending:
+        chain = pending.pop()
+        moved = True
+        while moved and chain[0] != chain[-1]:
+            moved = False
+            for i, w in enumerate(pending):
+                if chain[-1] == w[0]:
+                    chain += w[1:]
+                elif chain[-1] == w[-1]:
+                    chain += w[-2::-1]
+                elif chain[0] == w[-1]:
+                    chain = w[:-1] + chain
+                elif chain[0] == w[0]:
+                    chain = w[:0:-1] + chain
+                else:
+                    continue
+                pending.pop(i)
+                moved = True
+                break
+        if len(chain) >= 4 and chain[0] == chain[-1]:
+            rings.append(chain)
+    return rings
+
+
 def fetch_osm_buildings(bbox, verbose, no_cache) -> list:
-    """List of {'coords': [(lon,lat), ...], 'tags': {...}} for every OSM
-    building way in the bbox. Cached as raw Overpass JSON."""
+    """List of {'outer': [(lon,lat)...], 'holes': [[...], ...], 'tags': {...}}
+    for every OSM building (ways and multipolygon relations) in the bbox.
+    Cached as raw Overpass JSON."""
     if requests is None:
         raise RuntimeError("The 'requests' package is required.")
     CACHE_DIR.mkdir(exist_ok=True)
     min_lat, min_lon, max_lat, max_lon = bbox
-    sig = f"{CACHE_VERSION}|{min_lat:.6f},{min_lon:.6f},{max_lat:.6f},{max_lon:.6f}"
+    sig = f"{CACHE_VERSION}|mp2|{min_lat:.6f},{min_lon:.6f},{max_lat:.6f},{max_lon:.6f}"
     path = CACHE_DIR / f"osm_v{CACHE_VERSION}_{hashlib.sha1(sig.encode()).hexdigest()[:16]}.json"
 
     if path.exists() and not no_cache:
         print(f"Using cached OSM buildings: {path.name}")
         data = json.loads(path.read_text())
     else:
+        b = f"{min_lat},{min_lon},{max_lat},{max_lon}"
         q = (f"[out:json][timeout:90];"
-             f'way["building"]({min_lat},{min_lon},{max_lat},{max_lon});'
-             f"out tags geom;")
-        headers = {"User-Agent": "topo2stl/1.0 (+https://github.com/petebouch/topo2stl)"}
+             f'(way["building"]({b});relation["building"]["type"="multipolygon"]({b}););'
+             f"out geom;")
+        headers = {"User-Agent": "topo2stl/1.0 (+https://github.com/PeteBoucher/topo2stl)"}
         data = None
         for ep in OVERPASS_ENDPOINTS:
             try:
@@ -354,32 +399,52 @@ def fetch_osm_buildings(bbox, verbose, no_cache) -> list:
         path.write_text(json.dumps(data))
         print(f"Cached OSM buildings -> {path.name}")
 
-    out = []
+    out, rels = [], 0
     for el in data.get("elements", []):
-        if el.get("type") != "way" or "geometry" not in el:
-            continue
-        pts = [(p["lon"], p["lat"]) for p in el["geometry"]]
-        if len(pts) >= 4:                       # closed ring (first == last)
-            out.append({"coords": pts, "tags": el.get("tags", {})})
+        tags = el.get("tags", {})
+        if el.get("type") == "way" and "geometry" in el:
+            pts = [(p["lon"], p["lat"]) for p in el["geometry"]]
+            if len(pts) >= 4:
+                out.append({"outer": pts, "holes": [], "tags": tags})
+        elif el.get("type") == "relation" and el.get("tags", {}).get("type") == "multipolygon":
+            outers = [[(p["lon"], p["lat"]) for p in m["geometry"]]
+                      for m in el.get("members", [])
+                      if m.get("role") == "outer" and m.get("geometry")]
+            inners = [[(p["lon"], p["lat"]) for p in m["geometry"]]
+                      for m in el.get("members", [])
+                      if m.get("role") == "inner" and m.get("geometry")
+                      and len(m["geometry"]) >= 4]
+            for ring in _stitch_rings(outers):
+                out.append({"outer": ring, "holes": inners, "tags": tags})
+                rels += 1
     if verbose:
-        print(f"  {len(out)} building ways")
+        print(f"  {len(out)} footprints ({rels} from multipolygon relations)")
     return out
+
+
+_TALL_BUILDING_TYPES = {"church", "cathedral", "basilica", "chapel", "mosque",
+                        "temple", "synagogue", "monastery"}
 
 
 def _building_height_m(tags: dict, level_h: float, default_h: float) -> float:
     for key in ("height", "building:height"):
         if key in tags:
             try:
-                return max(1.0, float(str(tags[key]).split()[0].replace(",", ".")))
+                h = float(str(tags[key]).split()[0].replace(",", "."))
+                if h >= 2.0:                    # ignore bogus placeholder heights
+                    return h
             except ValueError:
                 pass
     if "building:levels" in tags:
         try:
             lv = float(str(tags["building:levels"]).split(";")[0].replace(",", "."))
             rl = float(str(tags.get("roof:levels", 0) or 0).split(";")[0])
-            return max(2.0, (lv + 0.5 * rl) * level_h)
+            if lv >= 1:
+                return max(2.0, (lv + 0.5 * rl) * level_h)
         except ValueError:
             pass
+    if tags.get("building") in _TALL_BUILDING_TYPES:
+        return max(default_h, 14.0)             # monuments with no usable height
     return default_h
 
 
@@ -460,6 +525,23 @@ def cached_buildings(bbox, rows, cols, method, verbose, no_cache) -> np.ndarray:
     return grid
 
 
+def cached_veg(bbox, rows, cols, verbose, no_cache) -> np.ndarray:
+    """Vegetation-height grid (m) from IGN, cached like the elevation grid."""
+    CACHE_DIR.mkdir(exist_ok=True)
+    sig = json.dumps({"v": CACHE_VERSION, "kind": "veg",
+                      "bbox": [round(b, 6) for b in bbox],
+                      "rows": rows, "cols": cols}, sort_keys=True)
+    h = hashlib.sha1(sig.encode()).hexdigest()[:16]
+    path = CACHE_DIR / f"veg_v{CACHE_VERSION}_{rows}x{cols}_{h}.npy"
+    if path.exists() and not no_cache:
+        print(f"Using cached vegetation grid: {path.name}")
+        return np.load(path)
+    grid = download_veg_ign(bbox, rows, cols, verbose)
+    np.save(path, grid)
+    print(f"Cached vegetation grid -> {path.name}")
+    return grid
+
+
 # --------------------------------------------------------------------------- #
 # Grid smoothing
 # --------------------------------------------------------------------------- #
@@ -490,12 +572,12 @@ def gaussian_blur(a: np.ndarray, sigma: float) -> np.ndarray:
 def build_mesh(grid_m: np.ndarray, bbox, model_width_mm: float,
                z_exaggeration: float, base_mm: float,
                z_from_sea_level: bool,
-               buildings_m: np.ndarray | None = None,
-               building_exaggeration: float = 1.0) -> np.ndarray:
+               overlay_m: np.ndarray | None = None) -> np.ndarray:
     """
     grid_m: elevations in metres, [row0=north, col0=west].
-    buildings_m: optional building height-above-ground (m), same shape; added on
-        top of the terrain surface *after* z-exaggeration so it keeps true scale.
+    overlay_m: optional height-above-ground (m) for raster buildings / trees,
+        same shape; added on top of the terrain surface *after* z-exaggeration
+        so it keeps true scale.
     Returns an (n_tri, 3, 3) float32 array of triangle vertices.
     """
     min_lat, min_lon, max_lat, max_lon = bbox
@@ -515,8 +597,8 @@ def build_mesh(grid_m: np.ndarray, bbox, model_width_mm: float,
     z = (grid_m - base_ref) * mm_per_m * z_exaggeration
     z = z - z.min() + base_mm            # lift so lowest surface point sits at base_mm
     terrain_top_mm = float(z.max())
-    if buildings_m is not None:          # true-scale (not z-exaggerated) massing
-        z = z + buildings_m * mm_per_m * building_exaggeration
+    if overlay_m is not None:            # true-scale (not z-exaggerated) massing
+        z = z + overlay_m * mm_per_m
 
     X, Y = np.meshgrid(xs, ys)           # (rows, cols)
     top = np.stack([X, Y, z], axis=-1)   # (rows, cols, 3)
@@ -746,35 +828,41 @@ def add_osm_buildings(base_tris: list, info: dict, bbox, footprints: list,
     GROW = 0.04   # mm: grow each footprint so wall-to-wall neighbours overlap
                   # slightly rather than share an exact face (a CSG degeneracy)
 
+    def prep_ring(coords, want_ccw):
+        r = [to_xy(lon, lat) for lon, lat in coords[:-1]]     # drop closing dup
+        r = [(min(max(x, -3.0), W + 3.0), min(max(y, -3.0), H + 3.0)) for x, y in r]
+        if simplify_mm > 0 and len(r) > 4:
+            r = _simplify(r, simplify_mm)
+        r = [p for i, p in enumerate(r) if p != r[i - 1]]     # drop repeats
+        if len(r) < 3:
+            return None
+        if (_poly_area(r) < 0) == want_ccw:                   # fix winding
+            r = r[::-1]
+        return r
+
     prisms, skipped = [], 0
     for fp in footprints:
-        poly = [to_xy(lon, lat) for lon, lat in fp["coords"][:-1]]   # drop closing dup
-        # clamp wild vertices from buildings that straddle the bbox edge
-        poly = [(min(max(x, -3.0), W + 3.0), min(max(y, -3.0), H + 3.0))
-                for x, y in poly]
-        if simplify_mm > 0 and len(poly) > 4:
-            poly = _simplify(poly, simplify_mm)
-        poly = [p for i, p in enumerate(poly) if p != poly[i - 1]]  # drop repeats
-        if len(poly) < 3:
+        outer = prep_ring(fp["outer"], want_ccw=True)
+        if outer is None or _poly_area(outer) < min_area_mm2:
             skipped += 1
             continue
-        if _poly_area(poly) < 0:                # want CCW / positive for manifold3d
-            poly = poly[::-1]
-        if _poly_area(poly) < min_area_mm2:
-            skipped += 1
-            continue
+        polys = [outer]
+        for hole in fp.get("holes", []):
+            h = prep_ring(hole, want_ccw=False)               # holes wound CW
+            if h is not None and abs(_poly_area(h)) > min_area_mm2 * 0.25:
+                polys.append(h)
         # extrude from below the model base up to (highest terrain under the
         # footprint + building height): the prism always spans the full terrain
         # thickness so it can never float, and the roof clears the terrain.
         h_mm = _building_height_m(fp["tags"], level_h, default_h) * mm_per_m * exaggeration
-        top = terrain_z_max_under(poly) + h_mm
+        top = terrain_z_max_under(outer) + h_mm
         try:
-            cs = m3d.CrossSection([poly]).offset(GROW, m3d.JoinType.Miter)
+            cs = m3d.CrossSection(polys).offset(GROW, m3d.JoinType.Miter)
             pr = cs.extrude(top + 1.0).translate([0.0, 0.0, -1.0])
         except Exception:
             skipped += 1
             continue
-        if pr.is_empty() or pr.genus() != 0:   # self-intersecting / degenerate footprint
+        if pr.is_empty() or pr.status() != m3d.Error.NoError:
             skipped += 1
             continue
         prisms.append(pr)
@@ -1033,6 +1121,14 @@ def parse_args(argv=None):
     p.add_argument("--building-min-height", type=float, default=2.0,
                    help="raster only: zero out building cells below this many "
                         "metres (drops walls/sheds/noise)")
+    p.add_argument("--trees", action="store_true",
+                   help="add tree canopy from IGN's vegetation-class DSM "
+                        "(mdsn_v025, Spain) - parks, riverbanks, tree-lined "
+                        "streets. Forces 5 m elevation data.")
+    p.add_argument("--tree-exaggeration", type=float, default=1.0,
+                   help="vertical multiplier for trees only")
+    p.add_argument("--tree-min-height", type=float, default=2.0,
+                   help="drop vegetation cells below this many metres")
 
     p.add_argument("--emboss-coords", action="store_true",
                    help="mark each side wall with its edge coordinate (latitude "
@@ -1099,11 +1195,13 @@ def main(argv=None):
     mean_lat = (min_lat + max_lat) / 2
     real_w = (max_lon - min_lon) * m_per_deg_lon(mean_lat)
 
-    if a.buildings and a.source != "ign":
-        raise SystemExit("--buildings uses IGN data; only works with --source ign")
-    if a.buildings and a.ign_res != 5:
-        a.ign_res = 5                  # buildings need crisp terrain to sit on
-        print("Buildings: using 5 m elevation data (MDT05)")
+    needs_ign = a.trees or (a.buildings and a.building_source != "osm")
+    if needs_ign and a.source != "ign":
+        raise SystemExit("--trees and --building-source raster* need IGN data "
+                         "(--source ign)")
+    if (a.buildings or a.trees) and a.source == "ign" and a.ign_res != 5:
+        a.ign_res = 5                  # sit on crisp terrain
+        print("Using 5 m elevation data (MDT05)")
 
     print(f"BBox: {min_lat:.5f},{min_lon:.5f} -> {max_lat:.5f},{max_lon:.5f}")
     print(f"Grid: {rows} rows x {cols} cols")
@@ -1114,27 +1212,35 @@ def main(argv=None):
     if a.source == "tessadem" and a.unit == "feet":
         grid_m = grid_m * 0.3048      # mesh math is metric (IGN is always metres)
 
-    buildings_m = None                 # raster path: added inside build_mesh
-    osm_footprints = None              # osm path: unioned after build_mesh
-    if a.buildings:
-        mm_per_m = a.model_width / real_w
-        if a.building_source == "osm":
-            osm_footprints = fetch_osm_buildings(bbox, a.verbose, a.no_cache)
-            print(f"Buildings (osm): {len(osm_footprints)} footprints")
-        else:
-            method = {"raster": "surface",
-                      "raster-classified": "classified"}[a.building_source]
-            buildings_m = cached_buildings(bbox, rows, cols, method,
-                                           a.verbose, a.no_cache)
-            buildings_m = np.where(buildings_m < a.building_min_height, 0.0,
-                                   buildings_m)
-            tallest_mm = float(buildings_m.max()) * mm_per_m * a.building_exaggeration
-            n = int((buildings_m > 0).sum())
-            print(f"Buildings ({a.building_source}): {n} cells, tallest "
-                  f"{buildings_m.max():.0f} m -> {tallest_mm:.1f} mm on the model")
-            if tallest_mm < 0.6:
-                print("  ! buildings print < 0.6 mm tall at this scale - "
-                      "tighter --bbox or bigger --model-width")
+    mm_per_m = a.model_width / real_w
+    overlay_m = None                   # raster buildings + trees: added in build_mesh
+    osm_footprints = None              # osm buildings: unioned after build_mesh
+
+    def add_overlay(layer, exag):
+        nonlocal overlay_m
+        layer = layer * exag
+        overlay_m = layer if overlay_m is None else overlay_m + layer
+
+    if a.buildings and a.building_source == "osm":
+        osm_footprints = fetch_osm_buildings(bbox, a.verbose, a.no_cache)
+        print(f"Buildings (osm): {len(osm_footprints)} footprints")
+    elif a.buildings:
+        method = {"raster": "surface",
+                  "raster-classified": "classified"}[a.building_source]
+        b = cached_buildings(bbox, rows, cols, method, a.verbose, a.no_cache)
+        b = np.where(b < a.building_min_height, 0.0, b)
+        add_overlay(b, a.building_exaggeration)
+        tallest = float(b.max()) * mm_per_m * a.building_exaggeration
+        print(f"Buildings ({a.building_source}): {int((b > 0).sum())} cells, "
+              f"tallest {b.max():.0f} m -> {tallest:.1f} mm on the model")
+        if tallest < 0.6:
+            print("  ! buildings print < 0.6 mm tall - tighter --bbox / bigger --model-width")
+
+    if a.trees:
+        v = cached_veg(bbox, rows, cols, a.verbose, a.no_cache)
+        v = np.where(v < a.tree_min_height, 0.0, v)
+        add_overlay(v, a.tree_exaggeration)
+        print(f"Trees: {int((v > 0).sum())} canopy cells, tallest {v.max():.0f} m")
 
     # smooth the terrain (not the buildings) - post-download, cache untouched
     native_m = {5: 5.0, 25: 25.0}.get(a.ign_res, 25.0) if a.source == "ign" else 30.0
@@ -1151,9 +1257,7 @@ def main(argv=None):
         print(f"Smoothed terrain (sigma {smooth_label} cells)")
 
     tris, info = build_mesh(grid_m, bbox, a.model_width, a.z_exaggeration,
-                            a.base, a.sea_level,
-                            buildings_m=buildings_m,
-                            building_exaggeration=a.building_exaggeration)
+                            a.base, a.sea_level, overlay_m=overlay_m)
 
     if osm_footprints is not None:
         tris = add_osm_buildings(
@@ -1171,7 +1275,7 @@ def main(argv=None):
     out = Path(a.output) if a.output else Path(
         f"topo_{min_lat:.3f}_{min_lon:.3f}_{rows}x{cols}.stl")
     credit, stl_header = data_attribution(
-        a.source, a.ign_res, a.buildings,
+        a.source, a.ign_res, (a.buildings or a.trees),
         osm=(a.buildings and a.building_source == "osm"))
     write_binary_stl(tris, out, stl_header)
     if credit:
@@ -1188,6 +1292,7 @@ def main(argv=None):
         "smooth": round(sigma, 2),
         "buildings": (a.building_source if a.buildings else None),
         "building_exaggeration": (a.building_exaggeration if a.buildings else None),
+        "trees": bool(a.trees),
         "generator": "topo2stl",
         "attribution": credit,
     }

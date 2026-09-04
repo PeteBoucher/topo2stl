@@ -11,9 +11,14 @@ Loose list of things to do, roughly in priority order.
   - [x] Strategy B: `--building-source osm` (now the default) — OSM footprints
     extruded to prisms via manifold3d, unioned onto the terrain. Crisp walls,
     per-building heights from `building:levels`.
-  - [ ] B polish: courtyard footprints (OSM multipolygon relations, currently
-    skipped); a few non-manifold edges survive the union at exact precision
-    (slicer-repairable, but chase it); optional gabled roofs from `roof:shape`.
+  - [x] B: multipolygon relations (courtyard buildings — the Mezquita) with
+    holes; monument height fallback (14 m for churches/mosques); bogus
+    `height=0.1` tags ignored.
+  - [x] `--trees` — IGN vegetation DSM overlaid as canopy mounds (Spain).
+  - [ ] B polish: a few non-manifold edges survive the union at exact precision
+    (slicer-repairable, but chase it); optional gabled roofs from `roof:shape`;
+    OSM buildings currently seat on terrain+tree overlay (minor, buildings on
+    canopy cells float ~tree height).
   - [ ] Catastro footprints (100% Spain coverage + floor counts, needs UTM).
   - [ ] `--landmark "lat,lon,file.stl"` — drop a custom monument mesh.
   - [ ] Water mask — recess rivers/coast as a channel (Micropolitan style).
