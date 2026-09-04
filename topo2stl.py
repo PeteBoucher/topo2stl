@@ -860,9 +860,15 @@ def _manifold_to_soup(res) -> np.ndarray:
 
 def add_osm_buildings(base_tris: list, info: dict, bbox, footprints: list,
                       level_h: float, default_h: float, exaggeration: float,
-                      min_area_m2: float, simplify_mm: float) -> np.ndarray:
+                      min_area_m2: float, simplify_mm: float,
+                      roof_surface_tris=None) -> np.ndarray:
     """Extrude each OSM footprint to a prism seated on the terrain and union
-    the lot onto the terrain solid. Returns an (n,3,3) float32 soup."""
+    the lot onto the terrain solid. Returns an (n,3,3) float32 soup.
+
+    roof_surface_tris: optional closed mesh of the LiDAR surface (terrain +
+        building heights). If given, the prisms are made tall and intersected
+        with it, so each building takes the real roof shape instead of a flat
+        top."""
     if not _have_manifold():
         raise SystemExit("--building-source osm needs manifold3d:\n"
                          "  ./.venv/bin/pip install -r requirements.txt")
@@ -919,9 +925,13 @@ def add_osm_buildings(base_tris: list, info: dict, bbox, footprints: list,
                 polys.append(h)
         # extrude from below the model base up to (highest terrain under the
         # footprint + building height): the prism always spans the full terrain
-        # thickness so it can never float, and the roof clears the terrain.
-        h_mm = _building_height_m(fp["tags"], level_h, default_h) * mm_per_m * exaggeration
-        top = terrain_z_max_under(outer) + h_mm
+        # thickness so it can never float, and the roof clears the terrain. In
+        # lidar-roof mode the prism goes sky-high and is clipped later.
+        if roof_surface_tris is not None:
+            top = float(z_mm.max()) + 300.0
+        else:
+            h_mm = _building_height_m(fp["tags"], level_h, default_h) * mm_per_m * exaggeration
+            top = terrain_z_max_under(outer) + h_mm
         try:
             cs = m3d.CrossSection(polys).offset(GROW, m3d.JoinType.Miter)
             pr = cs.extrude(top + 1.0).translate([0.0, 0.0, -1.0])
@@ -941,6 +951,9 @@ def add_osm_buildings(base_tris: list, info: dict, bbox, footprints: list,
           f"union with terrain ...")
     terrain = _soup_to_manifold(base_tris)
     built = m3d.Manifold.batch_boolean(prisms, m3d.OpType.Add)   # merge blocks first
+    if roof_surface_tris is not None:                            # real roofscape
+        print("  clipping buildings to the LiDAR surface ...")
+        built = built ^ _soup_to_manifold(roof_surface_tris)
     res = terrain + built
     if res.is_empty():
         raise SystemExit("building union produced an empty mesh")
@@ -1172,6 +1185,11 @@ def parse_args(argv=None):
                         "minus terrain minus vegetation (blocky, ~5 m, offline "
                         "once cached); 'raster-classified' = IGN building-class "
                         "DSM (no trees, misses some monument roofs)")
+    p.add_argument("--building-roofs", choices=["flat", "lidar"], default="flat",
+                   help="osm: 'flat' extrudes each footprint to a flat top; "
+                        "'lidar' clips the prisms to IGN's LiDAR surface so the "
+                        "real roofscape shows (domes, the Mezquita's nave). "
+                        "Spain only, slower.")
     p.add_argument("--building-exaggeration", type=float, default=1.0,
                    help="vertical multiplier for buildings only (kept separate "
                         "from --z-exaggeration so massing stays true-scale)")
@@ -1261,10 +1279,13 @@ def main(argv=None):
     mean_lat = (min_lat + max_lat) / 2
     real_w = (max_lon - min_lon) * m_per_deg_lon(mean_lat)
 
-    needs_ign = a.trees or (a.buildings and a.building_source != "osm")
+    lidar_roofs = (a.buildings and a.building_source == "osm"
+                   and a.building_roofs == "lidar")
+    needs_ign = (a.trees or lidar_roofs
+                 or (a.buildings and a.building_source != "osm"))
     if needs_ign and a.source != "ign":
-        raise SystemExit("--trees and --building-source raster* need IGN data "
-                         "(--source ign)")
+        raise SystemExit("--trees, --building-roofs lidar and --building-source "
+                         "raster* need IGN data (--source ign)")
     if (a.buildings or a.trees) and a.source == "ign" and a.ign_res != 5:
         a.ign_res = 5                  # sit on crisp terrain
         print("Using 5 m elevation data (MDT05)")
@@ -1312,15 +1333,17 @@ def main(argv=None):
         add_overlay(v, a.tree_exaggeration)
         print(f"Trees: {int((v > 0).sum())} canopy cells, tallest {v.max():.0f} m")
 
-    if overlay_m is not None and osm_water:
+    wet = None
+    if osm_water and (overlay_m is not None or lidar_roofs):
         polys_mm = [[((lon - min_lon) / (max_lon - min_lon) * a.model_width,
                       (lat - min_lat) / (max_lat - min_lat) * model_h_mm)
                      for lon, lat in ring] for ring in osm_water]
-        wet = _rasterize_polys(polys_mm, rows, cols, a.model_width, model_h_mm)
-        if wet.any():
-            overlay_m = np.where(wet, 0.0, overlay_m)
-            print(f"  masked overlay over {int(wet.sum())} water cells "
-                  f"(bridges, boats)")
+        w = _rasterize_polys(polys_mm, rows, cols, a.model_width, model_h_mm)
+        if w.any():
+            wet = w
+            if overlay_m is not None:
+                overlay_m = np.where(wet, 0.0, overlay_m)
+            print(f"  {int(wet.sum())} water cells (overlay/roofs masked there)")
 
     # smooth the terrain (not the buildings) - post-download, cache untouched
     native_m = {5: 5.0, 25: 25.0}.get(a.ign_res, 25.0) if a.source == "ign" else 30.0
@@ -1340,10 +1363,21 @@ def main(argv=None):
                             a.base, a.sea_level, overlay_m=overlay_m)
 
     if osm_footprints is not None:
+        roof_tris = None
+        if lidar_roofs:
+            bh = cached_buildings(bbox, rows, cols, "surface", a.verbose, a.no_cache)
+            bh = np.where(bh < 1.0, 0.0, bh)
+            if wet is not None:                 # keep roofs off bridges too
+                bh = np.where(wet, 0.0, bh)
+            print("Building LiDAR roof surface ...")
+            roof_tris, _ = build_mesh(grid_m, bbox, a.model_width,
+                                      a.z_exaggeration, a.base, a.sea_level,
+                                      overlay_m=bh)
         tris = add_osm_buildings(
             tris, info, bbox, osm_footprints,
             a.building_level_height, a.building_default_height,
-            a.building_exaggeration, a.building_min_area, a.building_simplify)
+            a.building_exaggeration, a.building_min_area, a.building_simplify,
+            roof_surface_tris=roof_tris)
 
     if a.emboss_coords:
         tris = emboss_corner_coords(tris, info, bbox, a.emboss_height,

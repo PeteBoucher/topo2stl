@@ -17,10 +17,11 @@ Loose list of things to do, roughly in priority order.
   - [x] `--trees` — IGN vegetation DSM overlaid as canopy mounds (Spain).
   - [x] OSM footprints clipped to the base plate (no overhang); canopy /
     raster buildings masked over OSM water (no tree-line on the Puente Romano).
-  - [ ] B polish: a few non-manifold edges survive the union at exact precision
-    (slicer-repairable, but chase it); optional gabled roofs from `roof:shape`;
-    OSM buildings currently seat on terrain+tree overlay (minor, buildings on
-    canopy cells float ~tree height).
+  - [x] `--building-roofs lidar` — clip OSM prisms to the IGN LiDAR surface for
+    the real roofscape. Comes out perfectly clean (euler 2, 0 non-manifold).
+  - [ ] B polish: flat-roof union still leaves a few non-manifold edges at
+    exact precision (slicer-repairable); OSM buildings seat on terrain+tree
+    overlay (buildings on canopy cells float ~tree height).
   - [ ] Catastro footprints (100% Spain coverage + floor counts, needs UTM).
   - [ ] `--landmark "lat,lon,file.stl"` — drop a custom monument mesh.
   - [ ] Water mask — recess rivers/coast as a channel (Micropolitan style).

@@ -87,6 +87,7 @@ python topo2stl.py --bbox 36.98,-3.45,37.10,-3.28 --ign-res 5 \
 | `--building-exaggeration` | Buildings-only height multiplier (default 1.0). |
 | `--building-level-height` / `--building-default-height` | osm: metres per floor (3.0) and fallback height for untagged footprints (9.0). |
 | `--building-min-area` / `--building-simplify` | osm: drop footprints under N m² (10); simplify tolerance in model mm (0.4). |
+| `--building-roofs` | osm: `flat` (default) or `lidar` — clip prisms to the real LiDAR roofscape (Spain). |
 | `--trees` | Add tree canopy from IGN's vegetation DSM (Spain). `--tree-exaggeration`, `--tree-min-height`. |
 | `--emboss-coords` | Engrave each side wall's edge coordinate (see below). |
 | `--emboss-style` | `engraved` (cut in, default — needs `manifold3d`) or `raised` (stands proud). |
@@ -143,23 +144,30 @@ python topo2stl.py --center 37.8790,-4.7794 --width-km 0.7 \
   overhangs. Height per building from the `height` tag, else
   `building:levels × --building-level-height` (3 m), else 14 m for churches /
   mosques / monasteries with no other data, else `--building-default-height`.
-  Needs internet (Overpass); the response is cached. Roof shape is flat.
+  Needs internet (Overpass); the response is cached. Roofs are flat unless
+  `--building-roofs lidar` (below).
 - `raster` — IGN LiDAR surface model minus bald earth minus vegetation
   (`mds05 − mdt05 − mdsn_v025`), added to the grid. Blocky at ~5 m but captures
   rooflines and domes, and works offline once cached. Spain only.
 - `raster-classified` — IGN's building-class DSM directly. No trees, but drops
   some large low / monument roofs.
 
+**`--building-roofs lidar`** (osm only, Spain) clips the extruded prisms to
+IGN's LiDAR surface, so the flat tops become the **real roofscape** — domes,
+pitched roofs, the cathedral nave rising out of the Mezquita's hall. One
+intersection, adds a few seconds and needs the IGN surface data.
+
 **`--trees`** overlays tree canopy from IGN's vegetation-class DSM (`mdsn_v025`,
 2.5 m, Spain) — parks, riverbanks, tree-lined streets show as low bumpy mounds.
 Works with any `--building-source` or on its own. `--tree-exaggeration`,
-`--tree-min-height` to tune. The canopy (and raster buildings) is masked out
-over OSM water so bridges and boats don't turn into a line of trees.
+`--tree-min-height` to tune. The canopy (and roofs) are masked out over OSM
+water so bridges and boats don't turn into a line of trees.
 
 ```bash
+# Córdoba's Mezquita quarter, real roofs and trees
 python topo2stl.py --center 37.8785,-4.7790 --width-km 0.8 \
-  --grid 300 --model-width 190 --z-exaggeration 1.15 --base 4 \
-  --buildings --trees -o mezquita.stl --view
+  --grid 320 --model-width 190 --z-exaggeration 1.15 --base 4 \
+  --buildings --building-roofs lidar --trees -o mezquita.stl --view
 ```
 
 Notes:
