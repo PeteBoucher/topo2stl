@@ -438,7 +438,8 @@ def fetch_osm(bbox, verbose, no_cache) -> tuple[list, list]:
 
 
 _TALL_BUILDING_TYPES = {"church", "cathedral", "basilica", "chapel", "mosque",
-                        "temple", "synagogue", "monastery"}
+                        "temple", "synagogue", "monastery", "watermill",
+                        "tower", "castle"}
 
 
 def _building_height_m(tags: dict, level_h: float, default_h: float) -> float:
@@ -458,7 +459,9 @@ def _building_height_m(tags: dict, level_h: float, default_h: float) -> float:
                 return max(2.0, (lv + 0.5 * rl) * level_h)
         except ValueError:
             pass
-    if tags.get("building") in _TALL_BUILDING_TYPES:
+    if (tags.get("building") in _TALL_BUILDING_TYPES
+            or tags.get("historic") in _TALL_BUILDING_TYPES
+            or tags.get("man_made") in _TALL_BUILDING_TYPES):
         return max(default_h, 14.0)             # monuments with no usable height
     return default_h
 
@@ -912,7 +915,8 @@ def add_osm_buildings(base_tris: list, info: dict, bbox, footprints: list,
             r = r[::-1]
         return r
 
-    prisms, skipped = [], 0
+    SKY = float(z_mm.max()) + 300.0
+    flat_prisms, tall_prisms, skipped = [], [], 0
     for fp in footprints:
         outer = prep_ring(fp["outer"], want_ccw=True)
         if outer is None or _poly_area(outer) < min_area_mm2:
@@ -923,37 +927,38 @@ def add_osm_buildings(base_tris: list, info: dict, bbox, footprints: list,
             h = prep_ring(hole, want_ccw=False)               # holes wound CW
             if h is not None and abs(_poly_area(h)) > min_area_mm2 * 0.25:
                 polys.append(h)
-        # extrude from below the model base up to (highest terrain under the
-        # footprint + building height): the prism always spans the full terrain
-        # thickness so it can never float, and the roof clears the terrain. In
-        # lidar-roof mode the prism goes sky-high and is clipped later.
-        if roof_surface_tris is not None:
-            top = float(z_mm.max()) + 300.0
-        else:
-            h_mm = _building_height_m(fp["tags"], level_h, default_h) * mm_per_m * exaggeration
-            top = terrain_z_max_under(outer) + h_mm
+        h_mm = _building_height_m(fp["tags"], level_h, default_h) * mm_per_m * exaggeration
         try:
             cs = m3d.CrossSection(polys).offset(GROW, m3d.JoinType.Miter)
-            pr = cs.extrude(top + 1.0).translate([0.0, 0.0, -1.0])
+            # flat prism to the tag height - guarantees the building is at least
+            # this tall (small / open structures the LiDAR misses still show)
+            flat = cs.extrude(terrain_z_max_under(outer) + h_mm + 1.0
+                              ).translate([0.0, 0.0, -1.0])
         except Exception:
             skipped += 1
             continue
-        if pr.is_empty() or pr.status() != m3d.Error.NoError:
+        if flat.is_empty() or flat.status() != m3d.Error.NoError:
             skipped += 1
             continue
-        prisms.append(pr)
+        flat_prisms.append(flat)
+        if roof_surface_tris is not None:
+            tall = cs.extrude(SKY + 1.0).translate([0.0, 0.0, -1.0])
+            if not tall.is_empty() and tall.status() == m3d.Error.NoError:
+                tall_prisms.append(tall)
 
-    if not prisms:
+    if not flat_prisms:
         print(f"  no usable footprints ({skipped} skipped)")
         return np.asarray(base_tris, dtype=np.float32)
 
-    print(f"  extruding {len(prisms)} buildings ({skipped} skipped), "
+    print(f"  extruding {len(flat_prisms)} buildings ({skipped} skipped), "
           f"union with terrain ...")
     terrain = _soup_to_manifold(base_tris)
-    built = m3d.Manifold.batch_boolean(prisms, m3d.OpType.Add)   # merge blocks first
-    if roof_surface_tris is not None:                            # real roofscape
+    built = m3d.Manifold.batch_boolean(flat_prisms, m3d.OpType.Add)
+    if tall_prisms:                                              # add real roofscape
         print("  clipping buildings to the LiDAR surface ...")
-        built = built ^ _soup_to_manifold(roof_surface_tris)
+        roofed = m3d.Manifold.batch_boolean(tall_prisms, m3d.OpType.Add)
+        roofed = roofed ^ _soup_to_manifold(roof_surface_tris)
+        built = built + roofed
     res = terrain + built
     if res.is_empty():
         raise SystemExit("building union produced an empty mesh")
@@ -1333,17 +1338,23 @@ def main(argv=None):
         add_overlay(v, a.tree_exaggeration)
         print(f"Trees: {int((v > 0).sum())} canopy cells, tallest {v.max():.0f} m")
 
-    wet = None
-    if osm_water and (overlay_m is not None or lidar_roofs):
-        polys_mm = [[((lon - min_lon) / (max_lon - min_lon) * a.model_width,
-                      (lat - min_lat) / (max_lat - min_lat) * model_h_mm)
-                     for lon, lat in ring] for ring in osm_water]
-        w = _rasterize_polys(polys_mm, rows, cols, a.model_width, model_h_mm)
+    def to_mm(ring):
+        return [((lon - min_lon) / (max_lon - min_lon) * a.model_width,
+                 (lat - min_lat) / (max_lat - min_lat) * model_h_mm)
+                for lon, lat in ring]
+
+    # clear the tree canopy over open water - the LiDAR misclassifies the
+    # Puente Romano, boats and weirs as vegetation. Building footprints (the
+    # watermills in the river) are left alone.
+    if overlay_m is not None and osm_water:
+        w = _rasterize_polys([to_mm(r) for r in osm_water],
+                             rows, cols, a.model_width, model_h_mm)
+        if osm_footprints:
+            w &= ~_rasterize_polys([to_mm(f["outer"]) for f in osm_footprints],
+                                   rows, cols, a.model_width, model_h_mm)
         if w.any():
-            wet = w
-            if overlay_m is not None:
-                overlay_m = np.where(wet, 0.0, overlay_m)
-            print(f"  {int(wet.sum())} water cells (overlay/roofs masked there)")
+            overlay_m = np.where(w, 0.0, overlay_m)
+            print(f"  cleared canopy over {int(w.sum())} open-water cells")
 
     # smooth the terrain (not the buildings) - post-download, cache untouched
     native_m = {5: 5.0, 25: 25.0}.get(a.ign_res, 25.0) if a.source == "ign" else 30.0
@@ -1367,8 +1378,6 @@ def main(argv=None):
         if lidar_roofs:
             bh = cached_buildings(bbox, rows, cols, "surface", a.verbose, a.no_cache)
             bh = np.where(bh < 1.0, 0.0, bh)
-            if wet is not None:                 # keep roofs off bridges too
-                bh = np.where(wet, 0.0, bh)
             print("Building LiDAR roof surface ...")
             roof_tris, _ = build_mesh(grid_m, bbox, a.model_width,
                                       a.z_exaggeration, a.base, a.sea_level,

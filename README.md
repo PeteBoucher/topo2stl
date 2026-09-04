@@ -152,10 +152,11 @@ python topo2stl.py --center 37.8790,-4.7794 --width-km 0.7 \
 - `raster-classified` — IGN's building-class DSM directly. No trees, but drops
   some large low / monument roofs.
 
-**`--building-roofs lidar`** (osm only, Spain) clips the extruded prisms to
-IGN's LiDAR surface, so the flat tops become the **real roofscape** — domes,
-pitched roofs, the cathedral nave rising out of the Mezquita's hall. One
-intersection, adds a few seconds and needs the IGN surface data.
+**`--building-roofs lidar`** (osm only, Spain) also clips the prisms to IGN's
+LiDAR surface, so the flat tops pick up the **real roofscape** — domes, pitched
+roofs, the cathedral nave rising out of the Mezquita's hall. Each building is
+still floored at its tag height, so small / open structures the 5 m LiDAR misses
+(watermills, gates) don't vanish. Adds a couple of seconds.
 
 **`--trees`** overlays tree canopy from IGN's vegetation-class DSM (`mdsn_v025`,
 2.5 m, Spain) — parks, riverbanks, tree-lined streets show as low bumpy mounds.

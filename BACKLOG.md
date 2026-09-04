@@ -18,7 +18,9 @@ Loose list of things to do, roughly in priority order.
   - [x] OSM footprints clipped to the base plate (no overhang); canopy /
     raster buildings masked over OSM water (no tree-line on the Puente Romano).
   - [x] `--building-roofs lidar` — clip OSM prisms to the IGN LiDAR surface for
-    the real roofscape. Comes out perfectly clean (euler 2, 0 non-manifold).
+    the real roofscape, floored at the tag height so small/open structures the
+    5 m LiDAR misses (watermills, gates) stay visible. Water masking now only
+    clears the tree canopy over open water, not building roofs.
   - [ ] B polish: flat-roof union still leaves a few non-manifold edges at
     exact precision (slicer-repairable); OSM buildings seat on terrain+tree
     overlay (buildings on canopy cells float ~tree height).
