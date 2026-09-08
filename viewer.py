@@ -176,6 +176,7 @@ PAGE = r"""<!doctype html>
   #area button:disabled { opacity: .4; cursor: default; }
   #area .zoom { display: flex; gap: 4px; justify-content: center; margin-bottom: 8px; }
   #area .zoom button { flex: 1; padding: 4px 0; }
+  #area .key { font-size: 10px; color: #6b7480; text-align: center; margin-bottom: 8px; }
   #area .rd { font-size: 11px; color: #9db3c9; line-height: 1.5; margin-bottom: 8px;
     font-variant-numeric: tabular-nums; }
   #area .rd b { color: #eef2f6; }
@@ -223,6 +224,7 @@ PAGE = r"""<!doctype html>
     <span></span><button data-pan="s">▼</button><span></span>
   </div>
   <div class="zoom"><button data-zoom="in">− zoom in</button><button data-zoom="out">+ zoom out</button></div>
+  <div class="key" id="areahintk"></div>
   <div class="rd" id="aread"></div>
   <button id="bregen">Regenerate STL</button>
   <div id="areahint"></div>
@@ -572,10 +574,17 @@ function zoomPend(k) {
 }
 
 document.querySelectorAll('#area .pad button[data-pan]').forEach(b =>
-  b.onclick = () => ({ n: () => panPend(0.15, 0), s: () => panPend(-0.15, 0),
-                       e: () => panPend(0, 0.15), w: () => panPend(0, -0.15) }[b.dataset.pan]()));
+  b.onclick = ev => {
+    const d = ev.shiftKey ? 0.02 : (ev.altKey ? 0.20 : 0.07);   // fine / coarse / normal
+    ({ n: () => panPend(d, 0), s: () => panPend(-d, 0),
+       e: () => panPend(0, d), w: () => panPend(0, -d) }[b.dataset.pan])();
+  });
 document.querySelectorAll('#area .zoom button[data-zoom]').forEach(b =>
-  b.onclick = () => zoomPend(b.dataset.zoom === 'in' ? 0.8 : 1.25));
+  b.onclick = ev => {
+    const step = ev.shiftKey ? 0.03 : (ev.altKey ? 0.25 : 0.11);
+    zoomPend(b.dataset.zoom === 'in' ? 1 - step : 1 / (1 - step));
+  });
+$('areahintk').textContent = 'Shift = fine · Alt = coarse';
 $('areset').onclick = () => { if (meta) { pend = meta.bbox.slice(); refreshArea(); } };
 
 $('barea').onclick = e => {
