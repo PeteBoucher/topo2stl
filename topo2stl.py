@@ -633,6 +633,30 @@ def gaussian_blur(a: np.ndarray, sigma: float) -> np.ndarray:
     return out
 
 
+def _morph(a, r, op):
+    """Square-window grayscale erosion (op=min) or dilation (op=max)."""
+    out = a
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            if dy or dx:
+                out = op(out, np.roll(a, (dy, dx), axis=(0, 1)))
+    return out
+
+
+def clip_peaks(grid: np.ndarray, strength: float, r: int = 2) -> np.ndarray:
+    """Grayscale morphological opening blended in by `strength` (0..1): pulls
+    isolated summits and knife-edge ridges (narrower than ~2r cells) down toward
+    their surroundings, so the print's top few layers aren't a scatter of tiny
+    islands the nozzle strings between. Broad terrain is untouched."""
+    if strength <= 0:
+        return grid
+    p = np.pad(grid.astype(np.float64), 2 * r, mode="edge")
+    p = _morph(p, r, np.minimum)                     # erode
+    p = _morph(p, r, np.maximum)                     # dilate -> opening (<= grid)
+    opened = p[2 * r:-2 * r, 2 * r:-2 * r]
+    return grid + strength * np.minimum(opened - grid, 0.0)
+
+
 # --------------------------------------------------------------------------- #
 # Mesh construction
 # --------------------------------------------------------------------------- #
@@ -1172,6 +1196,11 @@ def parse_args(argv=None):
                         "picks a sigma from how far the data is up/downsampled; "
                         "a number forces sigma in cells; '0' disables. Applied "
                         "after download - the cache is untouched.")
+    p.add_argument("--peak-smooth", type=float, default=0.0,
+                   help="0..1 - round off isolated summits and knife-edge "
+                        "ridges (a morphological opening blended in by this "
+                        "amount) so sharp peaks don't string / print as tiny "
+                        "islands. ~0.5 is gentle; leaves broad terrain alone.")
     p.add_argument("--base", type=float, default=3.0,
                    help="solid base thickness in mm below the lowest terrain point")
     p.add_argument("--sea-level", action="store_true",
@@ -1369,6 +1398,11 @@ def main(argv=None):
     if sigma > 0:
         grid_m = gaussian_blur(grid_m, sigma)
         print(f"Smoothed terrain (sigma {smooth_label} cells)")
+    if a.peak_smooth > 0:
+        before = float(grid_m.max())
+        grid_m = clip_peaks(grid_m, min(a.peak_smooth, 1.0))
+        print(f"Rounded peaks (strength {a.peak_smooth}): summit dropped "
+              f"{before - grid_m.max():.1f} m")
 
     tris, info = build_mesh(grid_m, bbox, a.model_width, a.z_exaggeration,
                             a.base, a.sea_level, overlay_m=overlay_m)
@@ -1413,6 +1447,7 @@ def main(argv=None):
         "elev_m_per_mm": round(info["m_per_mm"], 4),   # for the viewer's contour lines
         "base_mm": a.base,
         "smooth": round(sigma, 2),
+        "peak_smooth": a.peak_smooth or None,
         "buildings": (a.building_source if a.buildings else None),
         "building_exaggeration": (a.building_exaggeration if a.buildings else None),
         "trees": bool(a.trees),
