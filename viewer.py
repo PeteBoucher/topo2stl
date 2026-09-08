@@ -83,14 +83,27 @@ def _strip_area_args(argv):
     return out
 
 
+def _area_args(argv, bbox):
+    """New area flags for a regenerate - keeps the model's original style
+    (--center/--width-km or --bbox)."""
+    if "--center" in argv or "--width-km" in argv:
+        import math
+        lat = (bbox[0] + bbox[2]) / 2
+        lon = (bbox[1] + bbox[3]) / 2
+        wkm = (bbox[3] - bbox[1]) * 111.320 * math.cos(math.radians(lat))
+        hkm = (bbox[2] - bbox[0]) * 111.320
+        return ["--center", f"{lat:.6f},{lon:.6f}",
+                "--width-km", f"{wkm:.4f}", "--height-km", f"{hkm:.4f}"]
+    return ["--bbox", ",".join(f"{v:.6f}" for v in bbox)]
+
+
 def _run_regen(bbox):
     stl = Handler.stl_path
     try:
         meta = json.loads(_sidecar(stl).read_text())
-        args = _strip_area_args(meta["argv"])
-        cmd = [sys.executable, str(TOPO2STL),
-               "--bbox", ",".join(f"{v:.6f}" for v in bbox),
-               *args, "-o", str(stl)]
+        argv = meta["argv"]
+        cmd = [sys.executable, str(TOPO2STL), *_area_args(argv, bbox),
+               *_strip_area_args(argv), "-o", str(stl)]
         with _regen_lock:
             _regen["log"] = "$ " + " ".join(cmd) + "\n\n"
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
