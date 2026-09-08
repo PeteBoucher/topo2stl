@@ -115,10 +115,15 @@ a **Relief** toggle (hypsometric tint + elevation contour lines at a real-metre
 interval). It polls the STL file and reloads the mesh on change, keeping your
 camera.
 
+**Area** opens a panel to pan / zoom the bounding box (a blue rectangle shows
+the new extent over the model) and **Regenerate STL** — the viewer re-runs
+`topo2stl.py` with the new `--bbox` and all the same other settings, streams the
+log, and reloads. Needs the venv Python (numpy) and `topo2stl.py` beside
+`viewer.py`; models built before this need one rebuild from the CLI first.
+
 Each `topo2stl.py` run writes a small `<name>.topo.json` sidecar next to the STL
-(bounding box, source, vertical exaggeration, metres-per-mm). The viewer reads
-it for the corner labels and contour spacing. It's harmless to delete; slicers
-ignore it.
+(bounding box, settings, and the command line, for the viewer's Regenerate).
+It's harmless to delete; slicers ignore it.
 
 > The viewer loads three.js from a CDN, so it needs an internet connection the
 > first time a browser caches it.

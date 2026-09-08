@@ -1144,7 +1144,8 @@ def write_binary_stl(tris: np.ndarray, path: Path, header: str = "topo2stl"):
     lens[lens == 0] = 1.0
     normals = normals / lens
 
-    with open(path, "wb") as f:
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as f:
         h = header.encode("ascii", "replace")[:80]
         if h[:5].lower() == b"solid":        # never let a binary STL start with "solid"
             h = (b"topo2stl " + h)[:80]
@@ -1158,6 +1159,7 @@ def write_binary_stl(tris: np.ndarray, path: Path, header: str = "topo2stl"):
             buf += struct.pack("<3f", *tris[i, 2])
             buf += b"\x00\x00"
         f.write(buf)
+    os.replace(tmp, path)                     # atomic - the viewer never sees a half file
     print(f"Wrote {path}  ({path.stat().st_size/1e6:.1f} MB, {n} triangles)")
 
 
@@ -1453,6 +1455,8 @@ def main(argv=None):
         "trees": bool(a.trees),
         "generator": "topo2stl",
         "attribution": credit,
+        "argv": list(sys.argv[1:]),          # lets viewer.py re-run for a new bbox
+        "model_width": a.model_width,
     }
     meta_path = out.with_name(out.stem + ".topo.json")
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False),

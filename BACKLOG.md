@@ -27,6 +27,9 @@ Loose list of things to do, roughly in priority order.
   - [ ] Catastro footprints (100% Spain coverage + floor counts, needs UTM).
   - [ ] `--landmark "lat,lon,file.stl"` — drop a custom monument mesh.
   - [ ] Water mask — recess rivers/coast as a channel (Micropolitan style).
+- **viewer Area picker follow-ups** — done: pan/zoom bbox + Regenerate in the
+  viewer. Next: drag the blue rect directly; a 2D map thumbnail; remember the
+  panel state; `--replace` so the CLI `--view` re-runs don't orphan servers.
 - **viewer.py lifecycle** — `--view` starts the server detached
   (`start_new_session=True`) so it outlives the shell and a later
   `viewer.py X.stl` just hits "port busy". Add:

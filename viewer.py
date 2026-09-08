@@ -15,14 +15,96 @@ Standard library only - no pip install needed.
 from __future__ import annotations
 
 import http.server
+import json
 import os
 import socket
+import subprocess
 import sys
 import threading
 import webbrowser
 from pathlib import Path
 
 PORT = 8731
+TOPO2STL = Path(__file__).with_name("topo2stl.py")
+
+# area / output options stripped from the stored argv before re-running with a
+# fresh --bbox (name -> whether it takes a following value)
+_AREA_OPTS = {"--bbox": True, "--center": True, "--width-km": True,
+              "--height-km": True, "-o": True, "--output": True,
+              "--view": False, "--no-open": False}
+
+_regen = {"running": False, "done": False, "error": None, "log": ""}
+_regen_lock = threading.Lock()
+_numpy_ok = None
+
+
+def _have_numpy() -> bool:
+    global _numpy_ok
+    if _numpy_ok is None:
+        try:
+            _numpy_ok = subprocess.run(
+                [sys.executable, "-c", "import numpy"],
+                capture_output=True, timeout=20).returncode == 0
+        except Exception:
+            _numpy_ok = False
+    return _numpy_ok
+
+
+def _sidecar(stl: Path) -> Path:
+    return stl.with_name(stl.stem + ".topo.json")
+
+
+def _regen_available():
+    if not TOPO2STL.exists():
+        return False, "topo2stl.py is not next to viewer.py"
+    try:
+        meta = json.loads(_sidecar(Handler.stl_path).read_text())
+    except Exception:
+        return False, "no .topo.json sidecar for this model"
+    if not isinstance(meta.get("argv"), list):
+        return False, "sidecar predates regen - rebuild once from the CLI"
+    if not _have_numpy():
+        return False, "this Python has no numpy - start viewer.py with the venv Python"
+    return True, ""
+
+
+def _strip_area_args(argv):
+    out, skip = [], False
+    for tok in argv:
+        if skip:
+            skip = False
+            continue
+        name = tok.split("=", 1)[0]
+        if name in _AREA_OPTS:
+            if _AREA_OPTS[name] and "=" not in tok:
+                skip = True
+        else:
+            out.append(tok)
+    return out
+
+
+def _run_regen(bbox):
+    stl = Handler.stl_path
+    try:
+        meta = json.loads(_sidecar(stl).read_text())
+        args = _strip_area_args(meta["argv"])
+        cmd = [sys.executable, str(TOPO2STL),
+               "--bbox", ",".join(f"{v:.6f}" for v in bbox),
+               *args, "-o", str(stl)]
+        with _regen_lock:
+            _regen["log"] = "$ " + " ".join(cmd) + "\n\n"
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                cwd=str(TOPO2STL.parent))
+        for line in proc.stdout:
+            with _regen_lock:
+                _regen["log"] += line
+        rc = proc.wait()
+        err = None if rc == 0 else f"topo2stl exited with code {rc}"
+    except Exception as e:                    # noqa: BLE001
+        err = f"{type(e).__name__}: {e}"
+    with _regen_lock:
+        _regen.update(running=False, done=True, error=err)
 
 PAGE = r"""<!doctype html>
 <html>
@@ -67,6 +149,39 @@ PAGE = r"""<!doctype html>
     color: #eef2f6; text-shadow: 0 1px 3px #000, 0 0 3px #000; }
   .corner .lab .tag { color: #9db3c9; font-weight: 700; letter-spacing: .07em;
     margin-right: 6px; }
+  #area { position: fixed; left: 12px; bottom: 12px; width: 208px; padding: 12px;
+    background: rgba(20,23,28,.85); border: 1px solid #2b313a; border-radius: 8px;
+    backdrop-filter: blur(6px); }
+  #area h4 { margin: 0 0 8px; font-size: 11px; letter-spacing: .06em;
+    text-transform: uppercase; color: #8b95a1; font-weight: 700; }
+  #area .pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px;
+    width: 132px; margin: 0 auto 8px; }
+  #area .pad button { padding: 5px 0; }
+  #area button { background: #232830; color: #cdd3da; border: 1px solid #333b46;
+    border-radius: 5px; cursor: pointer; font: inherit; }
+  #area button:hover { background: #2d333d; color: #fff; }
+  #area button:disabled { opacity: .4; cursor: default; }
+  #area .zoom { display: flex; gap: 4px; justify-content: center; margin-bottom: 8px; }
+  #area .zoom button { flex: 1; padding: 4px 0; }
+  #area .rd { font-size: 11px; color: #9db3c9; line-height: 1.5; margin-bottom: 8px;
+    font-variant-numeric: tabular-nums; }
+  #area .rd b { color: #eef2f6; }
+  #area #bregen { width: 100%; padding: 7px 0; background: #2f6f3f;
+    border-color: #2f6f3f; color: #fff; font-weight: 600; }
+  #area #bregen:hover { background: #3a8a4d; }
+  #area #areahint { color: #d9a441; font-size: 10.5px; margin-top: 6px; }
+  #regen { position: fixed; inset: 0; background: rgba(10,12,15,.82);
+    display: none; flex-direction: column; align-items: center;
+    justify-content: center; z-index: 50; }
+  #regen .box { width: min(640px, 86vw); background: #14171c;
+    border: 1px solid #2b313a; border-radius: 10px; padding: 16px; }
+  #regen .box h3 { margin: 0 0 10px; font-size: 13px; }
+  #regen pre { margin: 0; max-height: 46vh; overflow: auto; white-space: pre-wrap;
+    font: 11px/1.45 ui-monospace, Menlo, monospace; color: #b7c0cb;
+    background: #0d0f12; border: 1px solid #23282f; border-radius: 6px; padding: 10px; }
+  #regen .row { margin-top: 10px; display: flex; gap: 8px; justify-content: flex-end; }
+  #regen .row button { background: #232830; color: #cdd3da; border: 1px solid #333b46;
+    border-radius: 6px; padding: 6px 14px; cursor: pointer; }
 </style>
 </head>
 <body>
@@ -84,8 +199,28 @@ PAGE = r"""<!doctype html>
   <button id="bwire">Wireframe</button>
   <button id="bspin">Spin</button>
   <button id="bcoords">Coords</button>
+  <button id="barea">Area</button>
 </div>
 <div id="err"></div>
+<div id="area" hidden>
+  <h4>Bounding box</h4>
+  <div class="pad">
+    <span></span><button data-pan="n">▲</button><span></span>
+    <button data-pan="w">◀</button><button id="areset" title="reset to current">⟳</button><button data-pan="e">▶</button>
+    <span></span><button data-pan="s">▼</button><span></span>
+  </div>
+  <div class="zoom"><button data-zoom="in">− zoom in</button><button data-zoom="out">+ zoom out</button></div>
+  <div class="rd" id="aread"></div>
+  <button id="bregen">Regenerate STL</button>
+  <div id="areahint"></div>
+</div>
+<div id="regen">
+  <div class="box">
+    <h3 id="regenttl">Regenerating…</h3>
+    <pre id="regenlog"></pre>
+    <div class="row"><button id="regenclose" hidden>Close</button></div>
+  </div>
+</div>
 <div id="compass">
   <div class="ring"></div>
   <div id="needle"><span class="lbl">N</span><span class="n"></span><span class="s"></span></div>
@@ -265,6 +400,7 @@ function setModel(rawGeometry, refit) {
   $('sz').textContent = size.z.toFixed(1);
   $('stamp').textContent = 'updated ' + new Date().toLocaleTimeString();
   updateReliefRange();
+  if (typeof refreshArea === 'function') refreshArea();
   if (refit) frame(geometry);
 }
 
@@ -333,13 +469,18 @@ function applyMeta(m) {
   if (!meta) {
     btn.disabled = true; btn.classList.remove('on');
     elSW.style.display = elNE.style.display = 'none';
+    $('barea').disabled = true;
+    pend = null;
   } else {
     btn.disabled = false;
     btn.classList.toggle('on', showCoords);
     elSW.querySelector('.txt').textContent = fmtDeg(meta.bbox[0], meta.bbox[1]);
     elNE.querySelector('.txt').textContent = fmtDeg(meta.bbox[2], meta.bbox[3]);
+    $('barea').disabled = false;
+    pend = meta.bbox.slice();
   }
   updateReliefRange();
+  if (typeof refreshArea === 'function') refreshArea();
 }
 
 function placeCorner(el, world) {
@@ -363,6 +504,114 @@ $('bcoords').onclick = e => {
   showCoords = !showCoords;
   e.target.classList.toggle('on', showCoords && !!meta);
 };
+
+// --- bounding-box pan / zoom + regenerate -----------------------------------
+let pend = null;                 // [minLat, minLon, maxLat, maxLon] pending
+let areaOpen = false;
+const rectMat = new THREE.LineBasicMaterial({ color: 0x53a7ff });
+let rect = new THREE.LineLoop(new THREE.BufferGeometry(), rectMat);
+rect.visible = false;
+scene.add(rect);
+
+const kmSpan = b => {
+  const mLat = (b[2] - b[0]) * 111320;
+  const mLon = (b[3] - b[1]) * 111320 * Math.cos((b[0] + b[2]) / 2 * Math.PI / 180);
+  return [mLon / 1000, mLat / 1000];          // [E-W, N-S]
+};
+const fmtLL = (lat, lon) =>
+  `${Math.abs(lat).toFixed(4)}°${lat >= 0 ? 'N' : 'S'} ${Math.abs(lon).toFixed(4)}°${lon >= 0 ? 'E' : 'W'}`;
+
+function refreshArea() {
+  if (!pend || !meta) return;
+  const [kw, kh] = kmSpan(pend);
+  const changed = meta.bbox.some((v, i) => Math.abs(v - pend[i]) > 1e-9);
+  $('aread').innerHTML =
+    `SW ${fmtLL(pend[0], pend[1])}<br>NE ${fmtLL(pend[2], pend[3])}<br>` +
+    `<b>${kw.toFixed(1)} × ${kh.toFixed(1)} km</b>${changed ? '' : '  (current)'}`;
+  // pending rect in model space, using the current bbox as the reference frame
+  if (mesh) {
+    const bb = mesh.geometry.boundingBox;
+    const W = bb.max.x - bb.min.x, H = bb.max.y - bb.min.y;
+    const [c0, c1, c2, c3] = meta.bbox;
+    const fx = lon => bb.min.x + (lon - c1) / (c3 - c1) * W;
+    const fy = lat => bb.min.y + (lat - c0) / (c2 - c0) * H;
+    const z = bb.max.z + Math.max(W, H) * 0.03;
+    const p = new Float32Array([
+      fx(pend[1]), fy(pend[0]), z, fx(pend[3]), fy(pend[0]), z,
+      fx(pend[3]), fy(pend[2]), z, fx(pend[1]), fy(pend[2]), z]);
+    rect.geometry.setAttribute('position', new THREE.BufferAttribute(p, 3));
+    rect.geometry.computeBoundingSphere();
+    rect.visible = areaOpen;
+  }
+}
+
+function panPend(dLat, dLon) {
+  const sLat = pend[2] - pend[0], sLon = pend[3] - pend[1];
+  pend = [pend[0] + dLat * sLat, pend[1] + dLon * sLon,
+          pend[2] + dLat * sLat, pend[3] + dLon * sLon];
+  refreshArea();
+}
+function zoomPend(k) {
+  const cLa = (pend[0] + pend[2]) / 2, cLo = (pend[1] + pend[3]) / 2;
+  const hLa = (pend[2] - pend[0]) / 2 * k, hLo = (pend[3] - pend[1]) / 2 * k;
+  pend = [cLa - hLa, cLo - hLo, cLa + hLa, cLo + hLo];
+  refreshArea();
+}
+
+document.querySelectorAll('#area .pad button[data-pan]').forEach(b =>
+  b.onclick = () => ({ n: () => panPend(0.15, 0), s: () => panPend(-0.15, 0),
+                       e: () => panPend(0, 0.15), w: () => panPend(0, -0.15) }[b.dataset.pan]()));
+document.querySelectorAll('#area .zoom button[data-zoom]').forEach(b =>
+  b.onclick = () => zoomPend(b.dataset.zoom === 'in' ? 0.8 : 1.25));
+$('areset').onclick = () => { if (meta) { pend = meta.bbox.slice(); refreshArea(); } };
+
+$('barea').onclick = e => {
+  areaOpen = !areaOpen;
+  $('area').hidden = !areaOpen;
+  e.target.classList.toggle('on', areaOpen);
+  rect.visible = areaOpen && !!pend;
+  if (areaOpen) checkRegenAvail();
+};
+
+async function checkRegenAvail() {
+  try {
+    const r = await (await fetch('/regen/available')).json();
+    $('bregen').disabled = !r.ok;
+    $('areahint').textContent = r.ok ? '' : r.reason;
+  } catch (_) { $('bregen').disabled = true; }
+}
+
+$('bregen').onclick = async () => {
+  if (!pend) return;
+  $('regen').style.display = 'flex';
+  $('regenttl').textContent = 'Regenerating…';
+  $('regenlog').textContent = 'starting…';
+  $('regenclose').hidden = true;
+  try {
+    const j = await (await fetch('/regen', {
+      method: 'POST', body: JSON.stringify({ bbox: pend }) })).json();
+    if (j.error) { regenFail(j.error); return; }
+  } catch (e) { regenFail(String(e)); return; }
+  pollRegen();
+};
+function regenFail(msg) {
+  $('regenttl').textContent = 'Regenerate failed';
+  $('regenlog').textContent += '\n\n' + msg;
+  $('regenclose').hidden = false;
+}
+async function pollRegen() {
+  let s;
+  try { s = await (await fetch('/regen/status', { cache: 'no-store' })).json(); }
+  catch (_) { setTimeout(pollRegen, 900); return; }
+  const pre = $('regenlog');
+  pre.textContent = s.log || '…';
+  pre.scrollTop = pre.scrollHeight;
+  if (s.running) { setTimeout(pollRegen, 700); return; }
+  if (s.error) { regenFail(s.error); return; }
+  $('regen').style.display = 'none';
+  currentVersion = null;                       // force the poll loop to reload
+}
+$('regenclose').onclick = () => { $('regen').style.display = 'none'; };
 
 const NORTH = new THREE.Vector3(0, 1, 0);   // +Y is north in topo2stl STLs
 const invQ = new THREE.Quaternion();
@@ -423,25 +672,55 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 data = self.stl_path.read_bytes()
                 self._send(data, "model/stl")
             elif p == "/meta":
-                sidecar = self.stl_path.with_name(self.stl_path.stem + ".topo.json")
-                if sidecar.exists():
-                    self._send(sidecar.read_bytes(), "application/json")
-                else:
-                    self._send(b"{}", "application/json")
+                sc = _sidecar(self.stl_path)
+                self._send(sc.read_bytes() if sc.exists() else b"{}",
+                           "application/json")
+            elif p == "/regen/available":
+                ok, reason = _regen_available()
+                self._send(json.dumps({"ok": ok, "reason": reason}).encode(),
+                           "application/json")
+            elif p == "/regen/status":
+                with _regen_lock:
+                    self._send(json.dumps(_regen).encode(), "application/json")
             else:
                 self._send(b"not found", "text/plain", 404)
         except OSError:
             self._send(b"file not ready", "text/plain", 503)
 
     def do_POST(self):
-        if self.path.split("?", 1)[0] != "/target":
-            self._send(b"not found", "text/plain", 404)
-            return
+        p = self.path.split("?", 1)[0]
         n = int(self.headers.get("Content-Length", 0))
-        new = Path(self.rfile.read(n).decode().strip()).resolve()
-        Handler.stl_path = new
-        print(f"retargeted -> {new}")
-        self._send(new.name.encode(), "text/plain")
+        body = self.rfile.read(n)
+        if p == "/target":
+            new = Path(body.decode().strip()).resolve()
+            Handler.stl_path = new
+            print(f"retargeted -> {new}")
+            self._send(new.name.encode(), "text/plain")
+        elif p == "/regen":
+            ok, reason = _regen_available()
+            if not ok:
+                self._send(json.dumps({"error": reason}).encode(),
+                           "application/json", 400)
+                return
+            try:
+                bb = [float(x) for x in json.loads(body)["bbox"]]
+                assert len(bb) == 4
+                assert bb[0] < bb[2] and bb[1] < bb[3]
+                assert -85 <= bb[0] and bb[2] <= 85 and -180 <= bb[1] and bb[3] <= 180
+            except Exception as e:                       # noqa: BLE001
+                self._send(json.dumps({"error": f"bad bbox: {e}"}).encode(),
+                           "application/json", 400)
+                return
+            with _regen_lock:
+                if _regen["running"]:
+                    self._send(b'{"error":"a regenerate is already running"}',
+                               "application/json", 409)
+                    return
+                _regen.update(running=True, done=False, error=None, log="")
+            threading.Thread(target=_run_regen, args=(bb,), daemon=True).start()
+            self._send(b'{"started":true}', "application/json")
+        else:
+            self._send(b"not found", "text/plain", 404)
 
     def log_message(self, *_):
         pass
