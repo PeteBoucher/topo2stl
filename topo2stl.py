@@ -47,6 +47,11 @@ EARTH_M_PER_DEG_LAT = 111_320.0
 
 IGN_WCS_URL = "https://servicios.idee.es/wcs-inspire/mdt"
 IGN_COVERAGE = {5: "Elevacion4258_5", 25: "Elevacion4258_25"}
+IGN_MDS_URL = "https://wcs-mds.idee.es/mds"
+IGN_MDS_SURFACE = "mds05"          # full digital surface model, 5 m
+IGN_MDS_VEG = "mdsn_v025"          # normalised DSM, vegetation class, 2.5 m
+IGN_MDS_BUILDINGS = "mdsn_e025"    # normalised DSM, building class, 2.5 m
+EPSG_4326_URI = "http://www.opengis.net/def/crs/EPSG/0/4326"
 
 # Bump when the fetch/parse/resample pipeline changes in a way that alters the
 # stored grid — old cache files with a different version are ignored.
@@ -234,37 +239,312 @@ def _parse_asc(text: str) -> np.ndarray:
     return grid
 
 
-def download_grid_ign(bbox, rows, cols, ign_res, verbose) -> np.ndarray:
+def _fetch_ign_wcs(url, coverage, bbox, rows, cols, verbose,
+                   subsetting_crs=None) -> np.ndarray:
+    """One IGN INSPIRE WCS GetCoverage, resampled server-side to rows x cols.
+    Returns a float grid, row 0 = north, NaN where the coverage has no data."""
     if requests is None:
         raise RuntimeError("The 'requests' package is required. pip install -r requirements.txt")
     min_lat, min_lon, max_lat, max_lon = bbox
-    coverage = IGN_COVERAGE[ign_res]
     params = {
-        "service": "WCS",
-        "version": "2.0.1",
-        "request": "GetCoverage",
-        "coverageId": coverage,
-        "format": "application/asc",
+        "service": "WCS", "version": "2.0.1", "request": "GetCoverage",
+        "coverageId": coverage, "format": "application/asc",
         "subset": [f"Lat({min_lat:.8f},{max_lat:.8f})",
                    f"Long({min_lon:.8f},{max_lon:.8f})"],
         "SCALESIZE": f"Long({cols}),Lat({rows})",
     }
-    print(f"Downloading {rows}x{cols} grid from IGN MDT{ign_res:02d} "
-          f"({coverage}) ...")
+    if subsetting_crs:
+        params["subsettingCrs"] = subsetting_crs
     if verbose:
-        print(f"  GET {IGN_WCS_URL} {params}")
-    r = requests.get(IGN_WCS_URL, params=params, timeout=180)
+        print(f"  GET {url} {params}")
+    r = requests.get(url, params=params, timeout=180)
     if r.status_code != 200 or b"ExceptionReport" in r.content[:2000]:
         raise RuntimeError(f"IGN WCS error (HTTP {r.status_code}): {r.text[:500]}")
     grid = _parse_asc(_split_multipart_asc(r.content))
     if grid.shape != (rows, cols):
-        # server may clamp to coverage extent; accept and let caller see it
         print(f"  note: server returned {grid.shape}, requested {(rows, cols)}")
+    return grid
+
+
+def download_grid_ign(bbox, rows, cols, ign_res, verbose) -> np.ndarray:
+    coverage = IGN_COVERAGE[ign_res]
+    print(f"Downloading {rows}x{cols} grid from IGN MDT{ign_res:02d} ({coverage}) ...")
+    grid = _fetch_ign_wcs(IGN_WCS_URL, coverage, bbox, rows, cols, verbose)
     if np.isnan(grid).any():
         n = int(np.isnan(grid).sum())
         print(f"  warning: {n} nodata cells (outside MDT coverage?); filled with min")
         grid = np.where(np.isnan(grid), np.nanmin(grid), grid)
     return grid
+
+
+def download_buildings_ign(bbox, rows, cols, method, verbose) -> np.ndarray:
+    """
+    Building height above ground (m), 0 where there is nothing.
+
+    method 'surface' (default): full surface model minus bald-earth minus
+        classified vegetation = every built structure, complete even where the
+        LiDAR building-classifier missed a roof (e.g. the Mezquita). Keeps a
+        little tree noise in leafy areas.
+    method 'classified': IGN's normalised DSM building class directly — excludes
+        trees but drops some monument / large low roofs.
+    """
+    def mds(cov):
+        return _fetch_ign_wcs(IGN_MDS_URL, cov, bbox, rows, cols, verbose,
+                              subsetting_crs=EPSG_4326_URI)
+
+    if method == "classified":
+        print(f"Downloading {rows}x{cols} building grid from IGN MDSn "
+              f"({IGN_MDS_BUILDINGS}) ...")
+        g = mds(IGN_MDS_BUILDINGS)
+        return np.where(np.isnan(g) | (g < 0), 0.0, g)
+
+    print(f"Downloading {rows}x{cols} building grid from IGN "
+          f"(mds05 - mdt05 - vegetation) ...")
+    surf = mds(IGN_MDS_SURFACE)
+    terr = _fetch_ign_wcs(IGN_WCS_URL, IGN_COVERAGE[5], bbox, rows, cols, verbose)
+    veg = mds(IGN_MDS_VEG)
+    h = surf - terr
+    h = np.where(np.isnan(h), 0.0, h)
+    veg = np.where(np.isnan(veg) | (veg < 0), 0.0, veg)
+    h = np.clip(h - veg, 0.0, None)
+    return gaussian_blur(h, 0.6)          # de-stair the upsampled edges a touch
+
+
+def download_veg_ign(bbox, rows, cols, verbose) -> np.ndarray:
+    """Vegetation (tree canopy) height above ground, m, from IGN's normalised
+    DSM vegetation class (mdsn_v025, 2.5 m). 0 where there is no vegetation."""
+    print(f"Downloading {rows}x{cols} vegetation grid from IGN MDSn "
+          f"({IGN_MDS_VEG}) ...")
+    g = _fetch_ign_wcs(IGN_MDS_URL, IGN_MDS_VEG, bbox, rows, cols, verbose,
+                       subsetting_crs=EPSG_4326_URI)
+    g = np.where(np.isnan(g) | (g < 0), 0.0, g)
+    return gaussian_blur(g, 0.7)
+
+
+# --------------------------------------------------------------------------- #
+# OpenStreetMap building footprints (Overpass)
+# --------------------------------------------------------------------------- #
+# Most buildings are a single closed `way`, but a building with a courtyard (the
+# Mezquita's Patio de los Naranjos) or a shared block is mapped as a
+# `type=multipolygon` relation. Its outer boundary can be split across several
+# member ways that only join up when chained end to end; `role=inner` members
+# are the courtyards. We fetch the relations too and stitch the members here so
+# those buildings aren't dropped.
+OVERPASS_ENDPOINTS = (
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+)
+
+
+def _stitch_rings(ways: list) -> list:
+    """Chain a relation's member ways (fragments of one boundary, in any order
+    or direction) into closed rings by matching shared endpoints."""
+    rings, pending = [], []
+    for w in ways:
+        if len(w) >= 4 and w[0] == w[-1]:
+            rings.append(w)
+        elif len(w) >= 2:
+            pending.append(list(w))
+    while pending:
+        chain = pending.pop()
+        moved = True
+        while moved and chain[0] != chain[-1]:
+            moved = False
+            for i, w in enumerate(pending):
+                if chain[-1] == w[0]:
+                    chain += w[1:]
+                elif chain[-1] == w[-1]:
+                    chain += w[-2::-1]
+                elif chain[0] == w[-1]:
+                    chain = w[:-1] + chain
+                elif chain[0] == w[0]:
+                    chain = w[:0:-1] + chain
+                else:
+                    continue
+                pending.pop(i)
+                moved = True
+                break
+        if len(chain) >= 4 and chain[0] == chain[-1]:
+            rings.append(chain)
+    return rings
+
+
+def fetch_osm(bbox, verbose, no_cache) -> tuple[list, list]:
+    """(buildings, water). buildings: {'outer','holes','tags'} for every OSM
+    building (ways + multipolygon relations). water: list of (lon,lat) rings for
+    lakes/rivers. Cached as raw Overpass JSON."""
+    if requests is None:
+        raise RuntimeError("The 'requests' package is required.")
+    CACHE_DIR.mkdir(exist_ok=True)
+    min_lat, min_lon, max_lat, max_lon = bbox
+    sig = f"{CACHE_VERSION}|mpw|{min_lat:.6f},{min_lon:.6f},{max_lat:.6f},{max_lon:.6f}"
+    path = CACHE_DIR / f"osm_v{CACHE_VERSION}_{hashlib.sha1(sig.encode()).hexdigest()[:16]}.json"
+
+    if path.exists() and not no_cache:
+        print(f"Using cached OSM data: {path.name}")
+        data = json.loads(path.read_text())
+    else:
+        b = f"{min_lat},{min_lon},{max_lat},{max_lon}"
+        q = (f"[out:json][timeout:90];("
+             f'way["building"]({b});relation["building"]["type"="multipolygon"]({b});'
+             f'way["natural"="water"]({b});relation["natural"="water"]({b});'
+             f'way["waterway"="riverbank"]({b});'
+             f");out geom;")
+        headers = {"User-Agent": "topo2stl/1.0 (+https://github.com/PeteBoucher/topo2stl)"}
+        data = None
+        for ep in OVERPASS_ENDPOINTS:
+            try:
+                print(f"Querying Overpass ({ep.split('/')[2]}) ...")
+                r = requests.post(ep, data={"data": q}, headers=headers, timeout=120)
+                if r.status_code == 200 and r.content[:1] == b"{":
+                    data = r.json()
+                    break
+                print(f"  {ep.split('/')[2]}: HTTP {r.status_code}")
+            except requests.RequestException as e:
+                print(f"  {ep.split('/')[2]}: {e}")
+        if data is None:
+            raise SystemExit("Overpass unavailable - try again later, or use "
+                             "--building-source raster")
+        path.write_text(json.dumps(data))
+        print(f"Cached OSM data -> {path.name}")
+
+    def rel_rings(el):
+        outers = [[(p["lon"], p["lat"]) for p in m["geometry"]]
+                  for m in el.get("members", [])
+                  if m.get("role") in ("outer", "") and m.get("geometry")]
+        inners = [[(p["lon"], p["lat"]) for p in m["geometry"]]
+                  for m in el.get("members", [])
+                  if m.get("role") == "inner" and m.get("geometry")
+                  and len(m["geometry"]) >= 4]
+        return _stitch_rings(outers), inners
+
+    buildings, water, rels = [], [], 0
+    for el in data.get("elements", []):
+        tags = el.get("tags", {})
+        is_water = tags.get("natural") == "water" or tags.get("waterway") == "riverbank"
+        if el.get("type") == "way" and "geometry" in el:
+            pts = [(p["lon"], p["lat"]) for p in el["geometry"]]
+            if len(pts) < 4:
+                continue
+            if is_water:
+                water.append(pts)
+            elif "building" in tags:
+                buildings.append({"outer": pts, "holes": [], "tags": tags})
+        elif el.get("type") == "relation" and tags.get("type") == "multipolygon":
+            outers, inners = rel_rings(el)
+            for ring in outers:
+                if is_water:
+                    water.append(ring)
+                elif "building" in tags:
+                    buildings.append({"outer": ring, "holes": inners, "tags": tags})
+                    rels += 1
+    if verbose:
+        print(f"  {len(buildings)} footprints ({rels} from relations), "
+              f"{len(water)} water polygons")
+    return buildings, water
+
+
+_TALL_BUILDING_TYPES = {"church", "cathedral", "basilica", "chapel", "mosque",
+                        "temple", "synagogue", "monastery", "watermill",
+                        "tower", "castle"}
+
+
+def _building_height_m(tags: dict, level_h: float, default_h: float) -> float:
+    for key in ("height", "building:height"):
+        if key in tags:
+            try:
+                h = float(str(tags[key]).split()[0].replace(",", "."))
+                if h >= 2.0:                    # ignore bogus placeholder heights
+                    return h
+            except ValueError:
+                pass
+    if "building:levels" in tags:
+        try:
+            lv = float(str(tags["building:levels"]).split(";")[0].replace(",", "."))
+            rl = float(str(tags.get("roof:levels", 0) or 0).split(";")[0])
+            if lv >= 1:
+                return max(2.0, (lv + 0.5 * rl) * level_h)
+        except ValueError:
+            pass
+    if (tags.get("building") in _TALL_BUILDING_TYPES
+            or tags.get("historic") in _TALL_BUILDING_TYPES
+            or tags.get("man_made") in _TALL_BUILDING_TYPES):
+        return max(default_h, 14.0)             # monuments with no usable height
+    return default_h
+
+
+def _poly_area(pts) -> float:
+    s = 0.0
+    for (x1, y1), (x2, y2) in zip(pts, pts[1:] + pts[:1]):
+        s += x1 * y2 - x2 * y1
+    return 0.5 * s
+
+
+def _simplify(pts, tol):
+    """Douglas-Peucker on an open point list."""
+    if len(pts) < 3:
+        return pts
+    (ax, ay), (bx, by) = pts[0], pts[-1]
+    dx, dy = bx - ax, by - ay
+    seg = math.hypot(dx, dy) or 1e-9
+    dmax, idx = 0.0, 0
+    for i in range(1, len(pts) - 1):
+        px, py = pts[i]
+        d = abs(dy * px - dx * py + bx * ay - by * ax) / seg
+        if d > dmax:
+            dmax, idx = d, i
+    if dmax <= tol:
+        return [pts[0], pts[-1]]
+    return _simplify(pts[:idx + 1], tol)[:-1] + _simplify(pts[idx:], tol)
+
+
+def _clip_rect(poly, x0, y0, x1, y1):
+    """Sutherland-Hodgman clip of a polygon to an axis-aligned rectangle."""
+    def clip(pts, keep, cut):
+        out = []
+        for i in range(len(pts)):
+            a, b = pts[i - 1], pts[i]
+            ka, kb = keep(a), keep(b)
+            if kb:
+                if not ka:
+                    out.append(cut(a, b))
+                out.append(b)
+            elif ka:
+                out.append(cut(a, b))
+        return out
+
+    p = list(poly)
+    p = clip(p, lambda q: q[0] >= x0,
+             lambda a, b: (x0, a[1] + (b[1] - a[1]) * (x0 - a[0]) / (b[0] - a[0])))
+    p = clip(p, lambda q: q[0] <= x1,
+             lambda a, b: (x1, a[1] + (b[1] - a[1]) * (x1 - a[0]) / (b[0] - a[0]))) if p else p
+    p = clip(p, lambda q: q[1] >= y0,
+             lambda a, b: (a[0] + (b[0] - a[0]) * (y0 - a[1]) / (b[1] - a[1]), y0)) if p else p
+    p = clip(p, lambda q: q[1] <= y1,
+             lambda a, b: (a[0] + (b[0] - a[0]) * (y1 - a[1]) / (b[1] - a[1]), y1)) if p else p
+    return p
+
+
+def _rasterize_polys(polys, rows, cols, W, H):
+    """Boolean (rows, cols) mask (row 0 = north) of cells whose centre falls
+    inside any polygon. polys are model-mm (x east, y north)."""
+    cx = (np.arange(cols)) / max(cols - 1, 1) * W
+    cy = (1.0 - np.arange(rows) / max(rows - 1, 1)) * H       # row 0 = north
+    X, Y = np.meshgrid(cx, cy)
+    mask = np.zeros((rows, cols), bool)
+    for poly in polys:
+        p = np.asarray(poly, float)
+        if len(p) < 3:
+            continue
+        inside = np.zeros_like(X, bool)
+        xj, yj = p[-1]
+        for xi, yi in p:
+            cond = ((yi > Y) != (yj > Y)) & \
+                   (X < (xj - xi) * (Y - yi) / (yj - yi + 1e-12) + xi)
+            inside ^= cond
+            xj, yj = xi, yi
+        mask |= inside
+    return mask
 
 
 # --------------------------------------------------------------------------- #
@@ -302,6 +582,40 @@ def cached_grid(source, key, bbox, rows, cols, unit, ign_res,
     return grid
 
 
+def cached_buildings(bbox, rows, cols, method, verbose, no_cache) -> np.ndarray:
+    """Building-height grid (m) from IGN, cached like the elevation grid."""
+    CACHE_DIR.mkdir(exist_ok=True)
+    sig = json.dumps({"v": CACHE_VERSION, "kind": "buildings", "method": method,
+                      "bbox": [round(b, 6) for b in bbox],
+                      "rows": rows, "cols": cols}, sort_keys=True)
+    h = hashlib.sha1(sig.encode()).hexdigest()[:16]
+    path = CACHE_DIR / f"buildings_{method}_v{CACHE_VERSION}_{rows}x{cols}_{h}.npy"
+    if path.exists() and not no_cache:
+        print(f"Using cached building grid: {path.name}")
+        return np.load(path)
+    grid = download_buildings_ign(bbox, rows, cols, method, verbose)
+    np.save(path, grid)
+    print(f"Cached building grid -> {path.name}")
+    return grid
+
+
+def cached_veg(bbox, rows, cols, verbose, no_cache) -> np.ndarray:
+    """Vegetation-height grid (m) from IGN, cached like the elevation grid."""
+    CACHE_DIR.mkdir(exist_ok=True)
+    sig = json.dumps({"v": CACHE_VERSION, "kind": "veg",
+                      "bbox": [round(b, 6) for b in bbox],
+                      "rows": rows, "cols": cols}, sort_keys=True)
+    h = hashlib.sha1(sig.encode()).hexdigest()[:16]
+    path = CACHE_DIR / f"veg_v{CACHE_VERSION}_{rows}x{cols}_{h}.npy"
+    if path.exists() and not no_cache:
+        print(f"Using cached vegetation grid: {path.name}")
+        return np.load(path)
+    grid = download_veg_ign(bbox, rows, cols, verbose)
+    np.save(path, grid)
+    print(f"Cached vegetation grid -> {path.name}")
+    return grid
+
+
 # --------------------------------------------------------------------------- #
 # Grid smoothing
 # --------------------------------------------------------------------------- #
@@ -331,9 +645,13 @@ def gaussian_blur(a: np.ndarray, sigma: float) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 def build_mesh(grid_m: np.ndarray, bbox, model_width_mm: float,
                z_exaggeration: float, base_mm: float,
-               z_from_sea_level: bool) -> np.ndarray:
+               z_from_sea_level: bool,
+               overlay_m: np.ndarray | None = None) -> np.ndarray:
     """
     grid_m: elevations in metres, [row0=north, col0=west].
+    overlay_m: optional height-above-ground (m) for raster buildings / trees,
+        same shape; added on top of the terrain surface *after* z-exaggeration
+        so it keeps true scale.
     Returns an (n_tri, 3, 3) float32 array of triangle vertices.
     """
     min_lat, min_lon, max_lat, max_lon = bbox
@@ -352,6 +670,9 @@ def build_mesh(grid_m: np.ndarray, bbox, model_width_mm: float,
     base_ref = 0.0 if z_from_sea_level else float(np.min(grid_m))
     z = (grid_m - base_ref) * mm_per_m * z_exaggeration
     z = z - z.min() + base_mm            # lift so lowest surface point sits at base_mm
+    terrain_top_mm = float(z.max())
+    if overlay_m is not None:            # true-scale (not z-exaggerated) massing
+        z = z + overlay_m * mm_per_m
 
     X, Y = np.meshgrid(xs, ys)           # (rows, cols)
     top = np.stack([X, Y, z], axis=-1)   # (rows, cols, 3)
@@ -400,7 +721,8 @@ def build_mesh(grid_m: np.ndarray, bbox, model_width_mm: float,
     print(f"  ground sampling: ~{real_w_m/ (cols-1):.0f} m/px E-W, "
           f"~{real_h_m/(rows-1):.0f} m/px N-S")
     print(f"  relief: {grid_m.max()-grid_m.min():.0f} m -> "
-          f"{z.max()-base_mm:.1f} mm  (exaggeration {z_exaggeration}x, base {base_mm} mm)")
+          f"{terrain_top_mm-base_mm:.1f} mm  (exaggeration {z_exaggeration}x, "
+          f"base {base_mm} mm)")
 
     info = {
         "model_w": model_width_mm,
@@ -413,6 +735,8 @@ def build_mesh(grid_m: np.ndarray, bbox, model_width_mm: float,
         "north_z": z[0].copy(),               # x: 0 -> W
         "west_z": z[::-1, 0].copy(),          # y: 0 -> H
         "east_z": z[::-1, cols - 1].copy(),   # y: 0 -> H
+        "z_mm": z.copy(),                     # full model-Z grid (mm), row0=north
+        "mm_per_m": mm_per_m,                 # model mm per real horizontal metre
     }
     return tris, info
 
@@ -504,15 +828,186 @@ def _have_manifold() -> bool:
         return False
 
 
+def _soup_to_manifold(tris):
+    """(n,3,3) triangle soup -> welded manifold3d.Manifold."""
+    import manifold3d as m3d
+    soup = np.asarray(tris, dtype=np.float64).reshape(-1, 3)
+    uniq, inv = np.unique(np.round(soup, 6), axis=0, return_inverse=True)
+    return m3d.Manifold(m3d.Mesh(vert_properties=uniq.astype(np.float32),
+                                 tri_verts=inv.reshape(-1, 3).astype(np.uint32)))
+
+
+def _manifold_to_soup(res) -> np.ndarray:
+    """manifold3d result -> (n,3,3) float32 soup. Welds the vertices manifold3d
+    flags as coincident (union-find, so chains resolve) and drops only
+    exactly-degenerate triangles."""
+    mesh = res.to_mesh()
+    verts = np.asarray(mesh.vert_properties)[:, :3].astype(np.float32)
+    tv = np.asarray(mesh.tri_verts).astype(np.int64)
+    mf = np.asarray(mesh.merge_from_vert)
+    mt = np.asarray(mesh.merge_to_vert)
+    if mf.size:
+        parent = np.arange(len(verts))
+
+        def find(i):
+            r = i
+            while parent[r] != r:
+                r = parent[r]
+            while parent[i] != r:
+                parent[i], i = r, parent[i]
+            return r
+
+        for a, b in zip(mf.tolist(), mt.tolist()):
+            parent[find(a)] = find(b)
+        tv = np.array([find(i) for i in range(len(verts))], dtype=np.int64)[tv]
+
+    out = verts[tv]
+    degen = ((out[:, 0] == out[:, 1]).all(1) |
+             (out[:, 1] == out[:, 2]).all(1) |
+             (out[:, 0] == out[:, 2]).all(1))
+    return out[~degen]
+
+
+def add_osm_buildings(base_tris: list, info: dict, bbox, footprints: list,
+                      level_h: float, default_h: float, exaggeration: float,
+                      min_area_m2: float, simplify_mm: float,
+                      roof_surface_tris=None, roof_h_m=None) -> np.ndarray:
+    """Extrude each OSM footprint to a prism seated on the terrain and union
+    the lot onto the terrain solid. Returns an (n,3,3) float32 soup.
+
+    Default ('flat'): every footprint is extruded to a flat top at its OSM tag
+    height (`height`, else `building:levels`, else a fallback).
+
+    LiDAR roofs: `roof_surface_tris` is a closed mesh of the IGN surface
+    (terrain + building heights) and `roof_h_m` the matching height-above-ground
+    grid (m). Each footprint is instead extruded sky-high and intersected with
+    that surface, so it takes the real roofscape. A footprint the LiDAR missed
+    (`roof_h_m` under it stays below ROOF_MISS_M) falls back to a flat tag-height
+    prism so small / open structures - watermills, city gates - don't vanish."""
+    if not _have_manifold():
+        raise SystemExit("--building-source osm needs manifold3d:\n"
+                         "  ./.venv/bin/pip install -r requirements.txt")
+    import manifold3d as m3d
+
+    min_lat, min_lon, max_lat, max_lon = bbox
+    W, H = info["model_w"], info["model_h"]
+    mm_per_m = info["mm_per_m"]
+    z_mm = info["z_mm"]                        # (rows, cols) model-Z, row0 = north
+    rows, cols = z_mm.shape
+    min_area_mm2 = min_area_m2 * mm_per_m * mm_per_m
+
+    def to_xy(lon, lat):
+        return ((lon - min_lon) / (max_lon - min_lon) * W,
+                (lat - min_lat) / (max_lat - min_lat) * H)
+
+    ROOF_MISS_M = 4.0   # if the LiDAR sees less than this above ground under a
+                        # footprint, treat the building as missed -> flat prism
+
+    def _block_under(grid, poly):
+        xs = [p[0] for p in poly]
+        ys = [p[1] for p in poly]
+        cx = np.clip(np.array([min(xs), max(xs)]) / W, 0, 1) * (cols - 1)
+        cy = np.clip(np.array([min(ys), max(ys)]) / H, 0, 1) * (rows - 1)
+        r0, r1 = int(rows - 1 - cy[1]), int(np.ceil(rows - 1 - cy[0])) + 1
+        c0, c1 = int(cx[0]), int(np.ceil(cx[1])) + 1
+        return grid[max(r0, 0):r1, max(c0, 0):c1]
+
+    def terrain_z_max_under(poly):
+        block = _block_under(z_mm, poly)
+        return float(block.max()) if block.size else float(z_mm.max())
+
+    def lidar_h_max_under(poly):
+        if roof_h_m is None:
+            return 0.0
+        block = _block_under(roof_h_m, poly)
+        return float(block.max()) if block.size else 0.0
+
+    GROW = 0.04   # mm: grow each footprint so wall-to-wall neighbours overlap
+                  # slightly rather than share an exact face (a CSG degeneracy)
+
+    M = 0.1   # keep footprints just inside the base plate so nothing overhangs
+
+    def prep_ring(coords, want_ccw):
+        r = [to_xy(lon, lat) for lon, lat in coords[:-1]]     # drop closing dup
+        r = _clip_rect(r, M, M, W - M, H - M)                 # trim to the base
+        if simplify_mm > 0 and len(r) > 4:
+            r = _simplify(r, simplify_mm)
+        r = [p for i, p in enumerate(r) if p != r[i - 1]]     # drop repeats
+        if len(r) < 3:
+            return None
+        if (_poly_area(r) < 0) == want_ccw:                   # fix winding
+            r = r[::-1]
+        return r
+
+    SKY = float(z_mm.max()) + 300.0
+    flat_prisms, tall_prisms, skipped, made = [], [], 0, 0
+    for fp in footprints:
+        outer = prep_ring(fp["outer"], want_ccw=True)
+        if outer is None or _poly_area(outer) < min_area_mm2:
+            skipped += 1
+            continue
+        polys = [outer]
+        for hole in fp.get("holes", []):
+            h = prep_ring(hole, want_ccw=False)               # holes wound CW
+            if h is not None and abs(_poly_area(h)) > min_area_mm2 * 0.25:
+                polys.append(h)
+        h_mm = _building_height_m(fp["tags"], level_h, default_h) * mm_per_m * exaggeration
+        # LiDAR-roof mode: only give a flat prism to buildings the LiDAR missed
+        # (otherwise the flat top buries the real stepped roofscape).
+        want_flat = (roof_surface_tris is None
+                     or lidar_h_max_under(outer) < ROOF_MISS_M)
+        try:
+            cs = m3d.CrossSection(polys).offset(GROW, m3d.JoinType.Miter)
+            got = False
+            if want_flat:
+                flat = cs.extrude(terrain_z_max_under(outer) + h_mm + 1.0
+                                  ).translate([0.0, 0.0, -1.0])
+                if flat.is_empty() or flat.status() != m3d.Error.NoError:
+                    raise ValueError
+                flat_prisms.append(flat)
+                got = True
+            if roof_surface_tris is not None:
+                tall = cs.extrude(SKY + 1.0).translate([0.0, 0.0, -1.0])
+                if not tall.is_empty() and tall.status() == m3d.Error.NoError:
+                    tall_prisms.append(tall)
+                    got = True
+            made += got
+        except Exception:
+            skipped += 1
+            continue
+
+    if not flat_prisms and not tall_prisms:
+        print(f"  no usable footprints ({skipped} skipped)")
+        return np.asarray(base_tris, dtype=np.float32)
+
+    print(f"  {made} buildings ({skipped} skipped), union with terrain ...")
+    terrain = _soup_to_manifold(base_tris)
+    built = (m3d.Manifold.batch_boolean(flat_prisms, m3d.OpType.Add)
+             if flat_prisms else None)
+    if tall_prisms:                                              # real roofscape
+        print("  clipping buildings to the LiDAR surface ...")
+        roofed = m3d.Manifold.batch_boolean(tall_prisms, m3d.OpType.Add)
+        roofed = roofed ^ _soup_to_manifold(roof_surface_tris)
+        built = roofed if built is None else built + roofed
+    res = terrain + built
+    if res.is_empty():
+        raise SystemExit("building union produced an empty mesh")
+
+    # CSG on hundreds of prisms leaves a few zero-volume sliver shells; keep only
+    # the components with real volume and re-join them.
+    comps = [c for c in res.decompose() if c.volume() > 0.05]
+    if len(comps) > 1:
+        res = m3d.Manifold.batch_boolean(comps, m3d.OpType.Add)
+    elif comps:
+        res = comps[0]
+    return _manifold_to_soup(res)
+
+
 def _boolean_text(base_tris: list, boxes: list, op: str) -> np.ndarray:
     """base - text  (op='sub')  or  base + text  (op='add'), via manifold3d."""
     import manifold3d as m3d
 
-    soup = np.asarray(base_tris, dtype=np.float64).reshape(-1, 3)
-    uniq, inv = np.unique(np.round(soup, 6), axis=0, return_inverse=True)
-    base = m3d.Manifold(m3d.Mesh(
-        vert_properties=uniq.astype(np.float32),
-        tri_verts=inv.reshape(-1, 3).astype(np.uint32)))
+    base = _soup_to_manifold(base_tris)
     if base.is_empty():
         raise SystemExit("base mesh is not a valid solid for embossing")
 
@@ -534,18 +1029,7 @@ def _boolean_text(base_tris: list, boxes: list, op: str) -> np.ndarray:
     res = (base - text) if op == "sub" else (base + text)
     if res.is_empty():
         raise SystemExit("emboss boolean produced an empty mesh")
-
-    mesh = res.to_mesh()
-    verts = np.asarray(mesh.vert_properties)[:, :3].astype(np.float32)
-    tv = np.asarray(mesh.tri_verts)
-    mf, mt = np.asarray(mesh.merge_from_vert), np.asarray(mesh.merge_to_vert)
-    if mf.size:                       # weld the verts manifold3d marks coincident
-        remap = np.arange(len(verts))
-        remap[mf] = mt
-        tv = remap[tv]
-    out = verts[tv]
-    n = np.cross(out[:, 1] - out[:, 0], out[:, 2] - out[:, 0])
-    return out[np.linalg.norm(n, axis=1) > 1e-7]   # drop CSG sliver triangles
+    return _manifold_to_soup(res)
 
 
 def _fmt_lat(lat: float, d: int) -> str:
@@ -639,16 +1123,20 @@ def emboss_corner_coords(tris: list, info: dict, bbox, cap_mm: float,
     return np.asarray(tris, dtype=np.float32)
 
 
-def data_attribution(source: str, ign_res: int | None = None) -> tuple[str, str]:
+def data_attribution(source: str, ign_res: int | None = None,
+                     buildings: bool = False, osm: bool = False) -> tuple[str, str]:
     """(full credit line for the sidecar, ASCII short form for the 80-byte STL header)."""
+    osm_full = " · Building data © OpenStreetMap contributors (ODbL)" if osm else ""
+    osm_hdr = " + OSM" if osm else ""
     if source == "ign":
-        return ("Elevation data © Instituto Geográfico Nacional de "
-                "España (CNIG) — https://www.ign.es — CC-BY 4.0 "
-                "compatible, attribution required",
-                "topo2stl | Elevation (c) IGN Espana / CNIG")
+        what = "Elevation & building data" if (buildings and not osm) else "Elevation data"
+        return (f"{what} © Instituto Geográfico Nacional de España (CNIG) "
+                "— https://www.ign.es — CC-BY 4.0 compatible, attribution "
+                f"required{osm_full}",
+                f"topo2stl | (c) IGN Espana / CNIG{osm_hdr}")
     if source == "tessadem":
-        return ("Elevation data via the TessaDEM API — https://tessadem.com",
-                "topo2stl | Elevation via TessaDEM")
+        return (f"Elevation data via the TessaDEM API — https://tessadem.com{osm_full}",
+                f"topo2stl | Elevation via TessaDEM{osm_hdr}")
     return ("", "topo2stl")
 
 
@@ -662,7 +1150,8 @@ def write_binary_stl(tris: np.ndarray, path: Path, header: str = "topo2stl"):
     lens[lens == 0] = 1.0
     normals = normals / lens
 
-    with open(path, "wb") as f:
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as f:
         h = header.encode("ascii", "replace")[:80]
         if h[:5].lower() == b"solid":        # never let a binary STL start with "solid"
             h = (b"topo2stl " + h)[:80]
@@ -676,6 +1165,7 @@ def write_binary_stl(tris: np.ndarray, path: Path, header: str = "topo2stl"):
             buf += struct.pack("<3f", *tris[i, 2])
             buf += b"\x00\x00"
         f.write(buf)
+    os.replace(tmp, path)                     # atomic - the viewer never sees a half file
     print(f"Wrote {path}  ({path.stat().st_size/1e6:.1f} MB, {n} triangles)")
 
 
@@ -709,16 +1199,57 @@ def parse_args(argv=None):
                    help="printed model width in mm (E-W)")
     p.add_argument("--z-exaggeration", type=float, default=1.5,
                    help="vertical scale multiplier vs true scale")
-    p.add_argument("--smooth", type=float, default=0.0,
-                   help="Gaussian blur the elevation grid, sigma in cells "
-                        "(~0.8-1.5 removes server-resampling weave on large "
-                        "areas; applied after download, cache is untouched)")
+    p.add_argument("--smooth", default="auto",
+                   help="Gaussian blur the elevation grid: 'auto' (default) "
+                        "picks a sigma from how far the data is up/downsampled; "
+                        "a number forces sigma in cells; '0' disables. Applied "
+                        "after download - the cache is untouched.")
     p.add_argument("--base", type=float, default=3.0,
                    help="solid base thickness in mm below the lowest terrain point")
     p.add_argument("--sea-level", action="store_true",
                    help="measure height from 0 m elevation instead of the "
                         "lowest point in the tile (keeps bathymetry/altitude honest)")
     p.add_argument("--unit", choices=["meters", "feet"], default="meters")
+
+    p.add_argument("--buildings", action="store_true",
+                   help="add building massing on top of the terrain - for "
+                        "neighbourhood / city-block scenes. Forces 5 m "
+                        "elevation data.")
+    p.add_argument("--building-source",
+                   choices=["osm", "raster", "raster-classified"], default="osm",
+                   help="'osm' = OpenStreetMap footprints extruded to crisp "
+                        "prisms (needs internet); 'raster' = IGN LiDAR surface "
+                        "minus terrain minus vegetation (blocky, ~5 m, offline "
+                        "once cached); 'raster-classified' = IGN building-class "
+                        "DSM (no trees, misses some monument roofs)")
+    p.add_argument("--building-roofs", choices=["flat", "lidar"], default="flat",
+                   help="osm: 'flat' extrudes each footprint to a flat top; "
+                        "'lidar' clips the prisms to IGN's LiDAR surface so the "
+                        "real roofscape shows (domes, the Mezquita's nave). "
+                        "Spain only, slower.")
+    p.add_argument("--building-exaggeration", type=float, default=1.0,
+                   help="vertical multiplier for buildings only (kept separate "
+                        "from --z-exaggeration so massing stays true-scale)")
+    p.add_argument("--building-level-height", type=float, default=3.0,
+                   help="metres per floor when height comes from building:levels "
+                        "(osm)")
+    p.add_argument("--building-default-height", type=float, default=9.0,
+                   help="metres for an osm footprint with no height/levels tag")
+    p.add_argument("--building-min-area", type=float, default=10.0,
+                   help="drop osm footprints smaller than this many m^2")
+    p.add_argument("--building-simplify", type=float, default=0.4,
+                   help="osm footprint simplification tolerance, model mm")
+    p.add_argument("--building-min-height", type=float, default=2.0,
+                   help="raster only: zero out building cells below this many "
+                        "metres (drops walls/sheds/noise)")
+    p.add_argument("--trees", action="store_true",
+                   help="add tree canopy from IGN's vegetation-class DSM "
+                        "(mdsn_v025, Spain) - parks, riverbanks, tree-lined "
+                        "streets. Forces 5 m elevation data.")
+    p.add_argument("--tree-exaggeration", type=float, default=1.0,
+                   help="vertical multiplier for trees only")
+    p.add_argument("--tree-min-height", type=float, default=2.0,
+                   help="drop vegetation cells below this many metres")
 
     p.add_argument("--emboss-coords", action="store_true",
                    help="mark each side wall with its edge coordinate (latitude "
@@ -782,6 +1313,20 @@ def main(argv=None):
     if rows < 2 or cols < 2:
         raise SystemExit("grid must be at least 2x2")
 
+    mean_lat = (min_lat + max_lat) / 2
+    real_w = (max_lon - min_lon) * m_per_deg_lon(mean_lat)
+
+    lidar_roofs = (a.buildings and a.building_source == "osm"
+                   and a.building_roofs == "lidar")
+    needs_ign = (a.trees or lidar_roofs
+                 or (a.buildings and a.building_source != "osm"))
+    if needs_ign and a.source != "ign":
+        raise SystemExit("--trees, --building-roofs lidar and --building-source "
+                         "raster* need IGN data (--source ign)")
+    if (a.buildings or a.trees) and a.source == "ign" and a.ign_res != 5:
+        a.ign_res = 5                  # sit on crisp terrain
+        print("Using 5 m elevation data (MDT05)")
+
     print(f"BBox: {min_lat:.5f},{min_lon:.5f} -> {max_lat:.5f},{max_lon:.5f}")
     print(f"Grid: {rows} rows x {cols} cols")
 
@@ -791,12 +1336,90 @@ def main(argv=None):
     if a.source == "tessadem" and a.unit == "feet":
         grid_m = grid_m * 0.3048      # mesh math is metric (IGN is always metres)
 
-    if a.smooth > 0:                   # post-download; does not touch the cache
-        grid_m = gaussian_blur(grid_m, a.smooth)
-        print(f"Smoothed grid (sigma {a.smooth} cells)")
+    mm_per_m = a.model_width / real_w
+    model_h_mm = (max_lat - min_lat) * EARTH_M_PER_DEG_LAT * mm_per_m
+    overlay_m = None                   # raster buildings + trees: added in build_mesh
+    osm_footprints = None              # osm buildings: unioned after build_mesh
+    osm_water = []
+
+    def add_overlay(layer, exag):
+        nonlocal overlay_m
+        layer = layer * exag
+        overlay_m = layer if overlay_m is None else overlay_m + layer
+
+    if (a.buildings and a.building_source == "osm") or a.trees:
+        b, osm_water = fetch_osm(bbox, a.verbose, a.no_cache)
+        if a.buildings and a.building_source == "osm":
+            osm_footprints = b
+            print(f"Buildings (osm): {len(osm_footprints)} footprints")
+    if a.buildings and a.building_source != "osm":
+        method = {"raster": "surface",
+                  "raster-classified": "classified"}[a.building_source]
+        b = cached_buildings(bbox, rows, cols, method, a.verbose, a.no_cache)
+        b = np.where(b < a.building_min_height, 0.0, b)
+        add_overlay(b, a.building_exaggeration)
+        tallest = float(b.max()) * mm_per_m * a.building_exaggeration
+        print(f"Buildings ({a.building_source}): {int((b > 0).sum())} cells, "
+              f"tallest {b.max():.0f} m -> {tallest:.1f} mm on the model")
+        if tallest < 0.6:
+            print("  ! buildings print < 0.6 mm tall - tighter --bbox / bigger --model-width")
+
+    if a.trees:
+        v = cached_veg(bbox, rows, cols, a.verbose, a.no_cache)
+        v = np.where(v < a.tree_min_height, 0.0, v)
+        add_overlay(v, a.tree_exaggeration)
+        print(f"Trees: {int((v > 0).sum())} canopy cells, tallest {v.max():.0f} m")
+
+    def to_mm(ring):
+        return [((lon - min_lon) / (max_lon - min_lon) * a.model_width,
+                 (lat - min_lat) / (max_lat - min_lat) * model_h_mm)
+                for lon, lat in ring]
+
+    # clear the tree canopy over open water - the LiDAR misclassifies the
+    # Puente Romano, boats and weirs as vegetation. Building footprints (the
+    # watermills in the river) are left alone.
+    if overlay_m is not None and osm_water:
+        w = _rasterize_polys([to_mm(r) for r in osm_water],
+                             rows, cols, a.model_width, model_h_mm)
+        if osm_footprints:
+            w &= ~_rasterize_polys([to_mm(f["outer"]) for f in osm_footprints],
+                                   rows, cols, a.model_width, model_h_mm)
+        if w.any():
+            overlay_m = np.where(w, 0.0, overlay_m)
+            print(f"  cleared canopy over {int(w.sum())} open-water cells")
+
+    # smooth the terrain (not the buildings) - post-download, cache untouched
+    native_m = {5: 5.0, 25: 25.0}.get(a.ign_res, 25.0) if a.source == "ign" else 30.0
+    if a.smooth == "auto":
+        # blur roughly to the native post spacing: heavier when the server
+        # upsampled a lot, a light floor otherwise (server-resampling weave)
+        sigma = min(4.0, max(0.8, 0.8 * native_m / (real_w / cols)))
+        smooth_label = f"{sigma:.1f} (auto)"
+    else:
+        sigma = float(a.smooth)
+        smooth_label = f"{sigma:.1f}"
+    if sigma > 0:
+        grid_m = gaussian_blur(grid_m, sigma)
+        print(f"Smoothed terrain (sigma {smooth_label} cells)")
 
     tris, info = build_mesh(grid_m, bbox, a.model_width, a.z_exaggeration,
-                            a.base, a.sea_level)
+                            a.base, a.sea_level, overlay_m=overlay_m)
+
+    if osm_footprints is not None:
+        roof_tris, roof_h = None, None
+        if lidar_roofs:
+            roof_h = cached_buildings(bbox, rows, cols, "surface",
+                                      a.verbose, a.no_cache)
+            roof_h = np.where(roof_h < 1.0, 0.0, roof_h)
+            print("Building LiDAR roof surface ...")
+            roof_tris, _ = build_mesh(grid_m, bbox, a.model_width,
+                                      a.z_exaggeration, a.base, a.sea_level,
+                                      overlay_m=roof_h)
+        tris = add_osm_buildings(
+            tris, info, bbox, osm_footprints,
+            a.building_level_height, a.building_default_height,
+            a.building_exaggeration, a.building_min_area, a.building_simplify,
+            roof_surface_tris=roof_tris, roof_h_m=roof_h)
 
     if a.emboss_coords:
         tris = emboss_corner_coords(tris, info, bbox, a.emboss_height,
@@ -807,7 +1430,9 @@ def main(argv=None):
 
     out = Path(a.output) if a.output else Path(
         f"topo_{min_lat:.3f}_{min_lon:.3f}_{rows}x{cols}.stl")
-    credit, stl_header = data_attribution(a.source, a.ign_res)
+    credit, stl_header = data_attribution(
+        a.source, a.ign_res, (a.buildings or a.trees),
+        osm=(a.buildings and a.building_source == "osm"))
     write_binary_stl(tris, out, stl_header)
     if credit:
         print(f"  attribution (required if published/sold): {credit}")
@@ -820,14 +1445,29 @@ def main(argv=None):
         "grid": [rows, cols],
         "elev_m_per_mm": round(info["m_per_mm"], 4),   # for the viewer's contour lines
         "base_mm": a.base,
-        "smooth": a.smooth,
+        "smooth": round(sigma, 2),
+        "buildings": (a.building_source if a.buildings else None),
+        "building_exaggeration": (a.building_exaggeration if a.buildings else None),
+        "trees": bool(a.trees),
         "generator": "topo2stl",
         "attribution": credit,
+        "argv": list(sys.argv[1:]),          # lets viewer.py re-run for a new bbox
+        "model_width": a.model_width,
     }
     meta_path = out.with_name(out.stem + ".topo.json")
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False),
                          encoding="utf-8")
     print(f"Wrote {meta_path}")
+
+    if credit:                       # ready-to-include credit sheet for sharing
+        notice = out.with_name(out.stem + ".CREDITS.txt")
+        notice.write_text(
+            f"{out.name}\nGenerated with topo2stl - {min_lat:.5f},{min_lon:.5f} "
+            f"to {max_lat:.5f},{max_lon:.5f}\n\n{credit}\n\n"
+            "topo2stl (the software) is MIT-licensed. This project is not "
+            "affiliated with or endorsed by the data providers.\n",
+            encoding="utf-8")
+        print(f"Wrote {notice}")
 
     if a.view:
         launch_viewer(out)

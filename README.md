@@ -15,7 +15,7 @@ model for free — but it works anywhere on Earth via a global fallback source.
 ## Quick start
 
 ```bash
-git clone https://github.com/petebouch/topo2stl.git
+git clone https://github.com/PeteBoucher/topo2stl.git
 cd topo2stl
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -79,9 +79,16 @@ python topo2stl.py --bbox 36.98,-3.45,37.10,-3.28 --ign-res 5 \
 | `--grid N` / `--grid ROWSxCOLS` | Output sampling. `N` auto-picks rows/cols from the area's real aspect ratio. ~`300` ≈ 180k triangles ≈ 9 MB STL. |
 | `--model-width` | Printed width in mm (E–W). Depth and height follow to true scale. |
 | `--z-exaggeration` | Vertical multiplier. `1.0` = true scale (usually too flat). `1.5`–`3` for mountains, more for lowlands. |
-| `--smooth` | Gaussian-blur the elevation grid, sigma in cells. `~1` cleans the fine resampling weave that shows up on large areas / high exaggeration. Applied after download — the cache is untouched, so trying values is instant. |
+| `--smooth` | Gaussian-blur the elevation grid. `auto` (default) scales the blur to how far the data was up/downsampled — heavy for a small area on 25 m data, light otherwise; a number forces sigma in cells; `0` disables. Applied after download, cache untouched. |
 | `--base` | Solid mm beneath the lowest terrain point. |
 | `--sea-level` | Height measured from 0 m rather than the tile minimum. |
+| `--buildings` | Add building massing — see below. Forces 5 m elevation data. |
+| `--building-source` | `osm` (default), `raster`, or `raster-classified` — see below. |
+| `--building-exaggeration` | Buildings-only height multiplier (default 1.0). |
+| `--building-level-height` / `--building-default-height` | osm: metres per floor (3.0) and fallback height for untagged footprints (9.0). |
+| `--building-min-area` / `--building-simplify` | osm: drop footprints under N m² (10); simplify tolerance in model mm (0.4). |
+| `--building-roofs` | osm: `flat` (default) or `lidar` — clip prisms to the real LiDAR roofscape (Spain). |
+| `--trees` | Add tree canopy from IGN's vegetation DSM (Spain). `--tree-exaggeration`, `--tree-min-height`. |
 | `--emboss-coords` | Engrave each side wall's edge coordinate (see below). |
 | `--emboss-style` | `engraved` (cut in, default — needs `manifold3d`) or `raised` (stands proud). |
 | `--emboss-height` / `--emboss-depth` | Text cap height (mm, default 4) and engraving/relief depth (mm, default 0.6). |
@@ -107,13 +114,78 @@ a **Relief** toggle (hypsometric tint + elevation contour lines at a real-metre
 interval). It polls the STL file and reloads the mesh on change, keeping your
 camera.
 
+**Area** opens a panel to pan / zoom the bounding box (a blue rectangle shows
+the new extent over the model) and **Regenerate STL** — the viewer re-runs
+`topo2stl.py` with the new `--bbox` and all the same other settings, streams the
+log, and reloads. Needs the venv Python (numpy) and `topo2stl.py` beside
+`viewer.py`; models built before this need one rebuild from the CLI first.
+
 Each `topo2stl.py` run writes a small `<name>.topo.json` sidecar next to the STL
-(bounding box, source, vertical exaggeration, metres-per-mm). The viewer reads
-it for the corner labels and contour spacing. It's harmless to delete; slicers
-ignore it.
+(bounding box, settings, and the command line, for the viewer's Regenerate).
+It's harmless to delete; slicers ignore it.
 
 > The viewer loads three.js from a CDN, so it needs an internet connection the
 > first time a browser caches it.
+
+---
+
+## Buildings
+
+`--buildings` adds building massing on top of the terrain, for
+neighbourhood / city-block scenes:
+
+```bash
+python topo2stl.py --center 37.8790,-4.7794 --width-km 0.7 \
+  --grid 280 --model-width 180 --z-exaggeration 1.15 --base 4 --buildings \
+  -o mezquita.stl --view
+```
+
+**`--building-source`:**
+
+- `osm` *(default)* — OpenStreetMap footprints (ways **and** multipolygon
+  relations, so courtyard buildings like the Mezquita come through with their
+  patio as a hole) extruded to crisp flat-top prisms, seated on the terrain and
+  unioned in (`manifold3d`). Footprints are clipped to the base plate so nothing
+  overhangs. Height per building from the `height` tag, else
+  `building:levels × --building-level-height` (3 m), else 14 m for churches /
+  mosques / monasteries with no other data, else `--building-default-height`.
+  Needs internet (Overpass); the response is cached. Roofs are flat unless
+  `--building-roofs lidar` (below).
+- `raster` — IGN LiDAR surface model minus bald earth minus vegetation
+  (`mds05 − mdt05 − mdsn_v025`), added to the grid. Blocky at ~5 m but captures
+  rooflines and domes, and works offline once cached. Spain only.
+- `raster-classified` — IGN's building-class DSM directly. No trees, but drops
+  some large low / monument roofs.
+
+**`--building-roofs lidar`** (osm only, Spain) also clips the prisms to IGN's
+LiDAR surface, so the flat tops pick up the **real roofscape** — domes, pitched
+roofs, the cathedral nave rising out of the Mezquita's hall. Each building is
+still floored at its tag height, so small / open structures the 5 m LiDAR misses
+(watermills, gates) don't vanish. Adds a couple of seconds.
+
+**`--trees`** overlays tree canopy from IGN's vegetation-class DSM (`mdsn_v025`,
+2.5 m, Spain) — parks, riverbanks, tree-lined streets show as low bumpy mounds.
+Works with any `--building-source` or on its own. `--tree-exaggeration`,
+`--tree-min-height` to tune. The canopy (and roofs) are masked out over OSM
+water so bridges and boats don't turn into a line of trees.
+
+```bash
+# Córdoba's Mezquita quarter, real roofs and trees
+python topo2stl.py --center 37.8785,-4.7790 --width-km 0.8 \
+  --grid 320 --model-width 190 --z-exaggeration 1.15 --base 4 \
+  --buildings --building-roofs lidar --trees -o mezquita.stl --view
+```
+
+Notes:
+
+- Building / tree height is **not** touched by `--z-exaggeration` (that would
+  make the skyline a bar chart); use `--building-exaggeration` /
+  `--tree-exaggeration`.
+- Keep the area small: `--width-km` of 0.3–2 km. The tool warns if the model
+  scale makes buildings print under 0.6 mm.
+- Best with a low `--z-exaggeration` (1–1.5) and a slightly thicker `--base`.
+- `--buildings` / `--trees` force 5 m elevation data. The `raster` sources and
+  `--trees` are Spain only; `osm` buildings work anywhere OSM has footprints.
 
 ---
 
@@ -189,10 +261,11 @@ publish or **sell** anything made with this tool, credit the data source:
 - **TessaDEM (`--source tessadem`)** — a commercial API; follow
   [their terms of service](https://tessadem.com/) for the plan you're on.
 
-Every run embeds the credit line in the STL's 80-byte header and in the
-`.topo.json` sidecar (`"attribution"`), and prints it to the console — but the
-header is easily lost when a model is re-exported, so still add the credit to
-whatever you publish or sell.
+Every run writes the credit three ways: into the STL's 80-byte header, into the
+`.topo.json` sidecar (`"attribution"`), and as a plain-text `<name>.CREDITS.txt`
+next to the STL — ready to drop into a listing or print alongside the model. The
+STL header is easily lost on re-export, so still add the credit to whatever you
+publish or sell.
 
 This project is not affiliated with or endorsed by the IGN, the CNIG, the Junta
 de Andalucía, or TessaDEM.

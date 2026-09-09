@@ -4,7 +4,41 @@ Loose list of things to do, roughly in priority order.
 
 ## Ideas
 
-- **Buildings and monuments** Explore the idea of obtaining 3d model information for buildings in cities to add to small scale maps in city centres.
+- **Buildings and monuments** — scoped in
+  [docs/buildings-scope.md](docs/buildings-scope.md).
+  - [x] Strategy A: `--building-source raster` — IGN LiDAR heights added to the
+    terrain grid. `--smooth auto` on by default to de-block the terrain.
+  - [x] Strategy B: `--building-source osm` (now the default) — OSM footprints
+    extruded to prisms via manifold3d, unioned onto the terrain. Crisp walls,
+    per-building heights from `building:levels`.
+  - [x] B: multipolygon relations (courtyard buildings — the Mezquita) with
+    holes; monument height fallback (14 m for churches/mosques); bogus
+    `height=0.1` tags ignored.
+  - [x] `--trees` — IGN vegetation DSM overlaid as canopy mounds (Spain).
+  - [x] OSM footprints clipped to the base plate (no overhang); canopy /
+    raster buildings masked over OSM water (no tree-line on the Puente Romano).
+  - [x] `--building-roofs lidar` — clip OSM prisms to the IGN LiDAR surface for
+    the real roofscape, floored at the tag height so small/open structures the
+    5 m LiDAR misses (watermills, gates) stay visible. Water masking now only
+    clears the tree canopy over open water, not building roofs.
+  - [ ] B polish: flat-roof union still leaves a few non-manifold edges at
+    exact precision (slicer-repairable); OSM buildings seat on terrain+tree
+    overlay (buildings on canopy cells float ~tree height).
+  - [ ] Catastro footprints (100% Spain coverage + floor counts, needs UTM).
+  - [ ] `--landmark "lat,lon,file.stl"` — drop a custom monument mesh.
+  - [ ] Water mask — recess rivers/coast as a channel (Micropolitan style).
+- **viewer Area picker follow-ups** — done: pan/zoom bbox + Regenerate in the
+  viewer. Next: drag the blue rect directly; a 2D map thumbnail; remember the
+  panel state; `--replace` so the CLI `--view` re-runs don't orphan servers.
+- **viewer.py lifecycle** — `--view` starts the server detached
+  (`start_new_session=True`) so it outlives the shell and a later
+  `viewer.py X.stl` just hits "port busy". Add:
+  - `/quit` POST endpoint → server calls `srv.shutdown()` on itself.
+  - `viewer.py --kill` — POST `/quit`, exit; "nothing running" if free.
+  - `viewer.py X.stl --replace` — kill any running viewer, then start fresh
+    on X.stl; make `topo2stl --view` use this so re-runs always land on the
+    right file.
+  - maybe `viewer.py --status` — print the running viewer's current STL.
 - Optional hillshade / contour bake into the printed surface itself.
 - `--preset` shelf (e.g. `wall-tile`, `desk`, `keyring`) bundling size + base +
   exaggeration.
@@ -12,10 +46,13 @@ Loose list of things to do, roughly in priority order.
 
 ## Known issues
 
-- **Surface corrugation on large-scale models.** IGN's WCS resamples its native
-  grid server-side when `SCALESIZE` asks for far fewer samples than the source
-  has, leaving a fine weave in the data; Z-exaggeration makes it obvious.
-  Handled: alternating triangulation diagonal, smooth normals in the viewer,
-  `--smooth SIGMA` (Gaussian on the grid, sigma ~1 clears it), README guidance
-  to raise `--grid`. Possible next step: auto-pick a default `--smooth` from the
-  download vs. native-resolution ratio.
+- **Sharp peaks string in the print.** Alpine summits print as sub-mm islands
+  the nozzle strings between. A `--peak-smooth` (morphological opening on the
+  grid) was prototyped and pulled from the buildings PR to land on its own —
+  re-add it. Real fix is dry filament + slicer combing/retraction.
+- **Surface corrugation / blockiness from WCS resampling.** IGN's WCS resamples
+  its native grid server-side; downsampling leaves a fine weave, upsampling
+  leaves native-post blocks. Handled: alternating triangulation diagonal,
+  smooth normals in the viewer, `--smooth auto` (sigma scales to the
+  up/downsample ratio), README guidance to raise `--grid`. Largely resolved;
+  revisit only if specific cases still look bad.
