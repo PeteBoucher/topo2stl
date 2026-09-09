@@ -80,7 +80,6 @@ python topo2stl.py --bbox 36.98,-3.45,37.10,-3.28 --ign-res 5 \
 | `--model-width` | Printed width in mm (E–W). Depth and height follow to true scale. |
 | `--z-exaggeration` | Vertical multiplier. `1.0` = true scale (usually too flat). `1.5`–`3` for mountains, more for lowlands. |
 | `--smooth` | Gaussian-blur the elevation grid. `auto` (default) scales the blur to how far the data was up/downsampled — heavy for a small area on 25 m data, light otherwise; a number forces sigma in cells; `0` disables. Applied after download, cache untouched. |
-| `--peak-smooth` | `0..1` — round off isolated summits / knife-edge ridges so sharp peaks don't string in the print. Broad terrain is left alone. |
 | `--base` | Solid mm beneath the lowest terrain point. |
 | `--sea-level` | Height measured from 0 m rather than the tile minimum. |
 | `--buildings` | Add building massing — see below. Forces 5 m elevation data. |
@@ -245,10 +244,6 @@ requirements.txt
 - For a large area, prefer a higher `--grid` (closer to the source resolution)
   and a touch of `--smooth` over a coarse grid — the coarse grid keeps the
   server's resampling weave.
-- Sharp alpine summits print as sub-millimetre islands and string. Dry
-  filament and slicer combing / retraction tuning are the real fix, but
-  `--peak-smooth 0.4–0.6` rounds the knife tips off (a morphological opening —
-  broad terrain is untouched) and takes the worst of it away.
 
 ---
 
@@ -266,10 +261,11 @@ publish or **sell** anything made with this tool, credit the data source:
 - **TessaDEM (`--source tessadem`)** — a commercial API; follow
   [their terms of service](https://tessadem.com/) for the plan you're on.
 
-Every run embeds the credit line in the STL's 80-byte header and in the
-`.topo.json` sidecar (`"attribution"`), and prints it to the console — but the
-header is easily lost when a model is re-exported, so still add the credit to
-whatever you publish or sell.
+Every run writes the credit three ways: into the STL's 80-byte header, into the
+`.topo.json` sidecar (`"attribution"`), and as a plain-text `<name>.CREDITS.txt`
+next to the STL — ready to drop into a listing or print alongside the model. The
+STL header is easily lost on re-export, so still add the credit to whatever you
+publish or sell.
 
 This project is not affiliated with or endorsed by the IGN, the CNIG, the Junta
 de Andalucía, or TessaDEM.

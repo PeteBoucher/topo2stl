@@ -46,9 +46,10 @@ Loose list of things to do, roughly in priority order.
 
 ## Known issues
 
-- **Sharp peaks string in the print.** Alpine summits print as sub-mm islands.
-  `--peak-smooth 0..1` (morphological opening blended in) rounds the knife tips;
-  broad terrain untouched. Real fix is dry filament + slicer combing/retraction.
+- **Sharp peaks string in the print.** Alpine summits print as sub-mm islands
+  the nozzle strings between. A `--peak-smooth` (morphological opening on the
+  grid) was prototyped and pulled from the buildings PR to land on its own —
+  re-add it. Real fix is dry filament + slicer combing/retraction.
 - **Surface corrugation / blockiness from WCS resampling.** IGN's WCS resamples
   its native grid server-side; downsampling leaves a fine weave, upsampling
   leaves native-post blocks. Handled: alternating triangulation diagonal,

@@ -324,6 +324,12 @@ def download_veg_ign(bbox, rows, cols, verbose) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 # OpenStreetMap building footprints (Overpass)
 # --------------------------------------------------------------------------- #
+# Most buildings are a single closed `way`, but a building with a courtyard (the
+# Mezquita's Patio de los Naranjos) or a shared block is mapped as a
+# `type=multipolygon` relation. Its outer boundary can be split across several
+# member ways that only join up when chained end to end; `role=inner` members
+# are the courtyards. We fetch the relations too and stitch the members here so
+# those buildings aren't dropped.
 OVERPASS_ENDPOINTS = (
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
@@ -331,7 +337,8 @@ OVERPASS_ENDPOINTS = (
 
 
 def _stitch_rings(ways: list) -> list:
-    """Chain a relation's outer/inner member ways into closed rings."""
+    """Chain a relation's member ways (fragments of one boundary, in any order
+    or direction) into closed rings by matching shared endpoints."""
     rings, pending = [], []
     for w in ways:
         if len(w) >= 4 and w[0] == w[-1]:
@@ -633,30 +640,6 @@ def gaussian_blur(a: np.ndarray, sigma: float) -> np.ndarray:
     return out
 
 
-def _morph(a, r, op):
-    """Square-window grayscale erosion (op=min) or dilation (op=max)."""
-    out = a
-    for dy in range(-r, r + 1):
-        for dx in range(-r, r + 1):
-            if dy or dx:
-                out = op(out, np.roll(a, (dy, dx), axis=(0, 1)))
-    return out
-
-
-def clip_peaks(grid: np.ndarray, strength: float, r: int = 2) -> np.ndarray:
-    """Grayscale morphological opening blended in by `strength` (0..1): pulls
-    isolated summits and knife-edge ridges (narrower than ~2r cells) down toward
-    their surroundings, so the print's top few layers aren't a scatter of tiny
-    islands the nozzle strings between. Broad terrain is untouched."""
-    if strength <= 0:
-        return grid
-    p = np.pad(grid.astype(np.float64), 2 * r, mode="edge")
-    p = _morph(p, r, np.minimum)                     # erode
-    p = _morph(p, r, np.maximum)                     # dilate -> opening (<= grid)
-    opened = p[2 * r:-2 * r, 2 * r:-2 * r]
-    return grid + strength * np.minimum(opened - grid, 0.0)
-
-
 # --------------------------------------------------------------------------- #
 # Mesh construction
 # --------------------------------------------------------------------------- #
@@ -888,14 +871,19 @@ def _manifold_to_soup(res) -> np.ndarray:
 def add_osm_buildings(base_tris: list, info: dict, bbox, footprints: list,
                       level_h: float, default_h: float, exaggeration: float,
                       min_area_m2: float, simplify_mm: float,
-                      roof_surface_tris=None) -> np.ndarray:
+                      roof_surface_tris=None, roof_h_m=None) -> np.ndarray:
     """Extrude each OSM footprint to a prism seated on the terrain and union
     the lot onto the terrain solid. Returns an (n,3,3) float32 soup.
 
-    roof_surface_tris: optional closed mesh of the LiDAR surface (terrain +
-        building heights). If given, the prisms are made tall and intersected
-        with it, so each building takes the real roof shape instead of a flat
-        top."""
+    Default ('flat'): every footprint is extruded to a flat top at its OSM tag
+    height (`height`, else `building:levels`, else a fallback).
+
+    LiDAR roofs: `roof_surface_tris` is a closed mesh of the IGN surface
+    (terrain + building heights) and `roof_h_m` the matching height-above-ground
+    grid (m). Each footprint is instead extruded sky-high and intersected with
+    that surface, so it takes the real roofscape. A footprint the LiDAR missed
+    (`roof_h_m` under it stays below ROOF_MISS_M) falls back to a flat tag-height
+    prism so small / open structures - watermills, city gates - don't vanish."""
     if not _have_manifold():
         raise SystemExit("--building-source osm needs manifold3d:\n"
                          "  ./.venv/bin/pip install -r requirements.txt")
@@ -912,15 +900,27 @@ def add_osm_buildings(base_tris: list, info: dict, bbox, footprints: list,
         return ((lon - min_lon) / (max_lon - min_lon) * W,
                 (lat - min_lat) / (max_lat - min_lat) * H)
 
-    def terrain_z_max_under(poly):
+    ROOF_MISS_M = 4.0   # if the LiDAR sees less than this above ground under a
+                        # footprint, treat the building as missed -> flat prism
+
+    def _block_under(grid, poly):
         xs = [p[0] for p in poly]
         ys = [p[1] for p in poly]
         cx = np.clip(np.array([min(xs), max(xs)]) / W, 0, 1) * (cols - 1)
         cy = np.clip(np.array([min(ys), max(ys)]) / H, 0, 1) * (rows - 1)
         r0, r1 = int(rows - 1 - cy[1]), int(np.ceil(rows - 1 - cy[0])) + 1
         c0, c1 = int(cx[0]), int(np.ceil(cx[1])) + 1
-        block = z_mm[max(r0, 0):r1, max(c0, 0):c1]
+        return grid[max(r0, 0):r1, max(c0, 0):c1]
+
+    def terrain_z_max_under(poly):
+        block = _block_under(z_mm, poly)
         return float(block.max()) if block.size else float(z_mm.max())
+
+    def lidar_h_max_under(poly):
+        if roof_h_m is None:
+            return 0.0
+        block = _block_under(roof_h_m, poly)
+        return float(block.max()) if block.size else 0.0
 
     GROW = 0.04   # mm: grow each footprint so wall-to-wall neighbours overlap
                   # slightly rather than share an exact face (a CSG degeneracy)
@@ -940,7 +940,7 @@ def add_osm_buildings(base_tris: list, info: dict, bbox, footprints: list,
         return r
 
     SKY = float(z_mm.max()) + 300.0
-    flat_prisms, tall_prisms, skipped = [], [], 0
+    flat_prisms, tall_prisms, skipped, made = [], [], 0, 0
     for fp in footprints:
         outer = prep_ring(fp["outer"], want_ccw=True)
         if outer is None or _poly_area(outer) < min_area_mm2:
@@ -952,37 +952,43 @@ def add_osm_buildings(base_tris: list, info: dict, bbox, footprints: list,
             if h is not None and abs(_poly_area(h)) > min_area_mm2 * 0.25:
                 polys.append(h)
         h_mm = _building_height_m(fp["tags"], level_h, default_h) * mm_per_m * exaggeration
+        # LiDAR-roof mode: only give a flat prism to buildings the LiDAR missed
+        # (otherwise the flat top buries the real stepped roofscape).
+        want_flat = (roof_surface_tris is None
+                     or lidar_h_max_under(outer) < ROOF_MISS_M)
         try:
             cs = m3d.CrossSection(polys).offset(GROW, m3d.JoinType.Miter)
-            # flat prism to the tag height - guarantees the building is at least
-            # this tall (small / open structures the LiDAR misses still show)
-            flat = cs.extrude(terrain_z_max_under(outer) + h_mm + 1.0
-                              ).translate([0.0, 0.0, -1.0])
+            got = False
+            if want_flat:
+                flat = cs.extrude(terrain_z_max_under(outer) + h_mm + 1.0
+                                  ).translate([0.0, 0.0, -1.0])
+                if flat.is_empty() or flat.status() != m3d.Error.NoError:
+                    raise ValueError
+                flat_prisms.append(flat)
+                got = True
+            if roof_surface_tris is not None:
+                tall = cs.extrude(SKY + 1.0).translate([0.0, 0.0, -1.0])
+                if not tall.is_empty() and tall.status() == m3d.Error.NoError:
+                    tall_prisms.append(tall)
+                    got = True
+            made += got
         except Exception:
             skipped += 1
             continue
-        if flat.is_empty() or flat.status() != m3d.Error.NoError:
-            skipped += 1
-            continue
-        flat_prisms.append(flat)
-        if roof_surface_tris is not None:
-            tall = cs.extrude(SKY + 1.0).translate([0.0, 0.0, -1.0])
-            if not tall.is_empty() and tall.status() == m3d.Error.NoError:
-                tall_prisms.append(tall)
 
-    if not flat_prisms:
+    if not flat_prisms and not tall_prisms:
         print(f"  no usable footprints ({skipped} skipped)")
         return np.asarray(base_tris, dtype=np.float32)
 
-    print(f"  extruding {len(flat_prisms)} buildings ({skipped} skipped), "
-          f"union with terrain ...")
+    print(f"  {made} buildings ({skipped} skipped), union with terrain ...")
     terrain = _soup_to_manifold(base_tris)
-    built = m3d.Manifold.batch_boolean(flat_prisms, m3d.OpType.Add)
-    if tall_prisms:                                              # add real roofscape
+    built = (m3d.Manifold.batch_boolean(flat_prisms, m3d.OpType.Add)
+             if flat_prisms else None)
+    if tall_prisms:                                              # real roofscape
         print("  clipping buildings to the LiDAR surface ...")
         roofed = m3d.Manifold.batch_boolean(tall_prisms, m3d.OpType.Add)
         roofed = roofed ^ _soup_to_manifold(roof_surface_tris)
-        built = built + roofed
+        built = roofed if built is None else built + roofed
     res = terrain + built
     if res.is_empty():
         raise SystemExit("building union produced an empty mesh")
@@ -1198,11 +1204,6 @@ def parse_args(argv=None):
                         "picks a sigma from how far the data is up/downsampled; "
                         "a number forces sigma in cells; '0' disables. Applied "
                         "after download - the cache is untouched.")
-    p.add_argument("--peak-smooth", type=float, default=0.0,
-                   help="0..1 - round off isolated summits and knife-edge "
-                        "ridges (a morphological opening blended in by this "
-                        "amount) so sharp peaks don't string / print as tiny "
-                        "islands. ~0.5 is gentle; leaves broad terrain alone.")
     p.add_argument("--base", type=float, default=3.0,
                    help="solid base thickness in mm below the lowest terrain point")
     p.add_argument("--sea-level", action="store_true",
@@ -1400,29 +1401,25 @@ def main(argv=None):
     if sigma > 0:
         grid_m = gaussian_blur(grid_m, sigma)
         print(f"Smoothed terrain (sigma {smooth_label} cells)")
-    if a.peak_smooth > 0:
-        before = float(grid_m.max())
-        grid_m = clip_peaks(grid_m, min(a.peak_smooth, 1.0))
-        print(f"Rounded peaks (strength {a.peak_smooth}): summit dropped "
-              f"{before - grid_m.max():.1f} m")
 
     tris, info = build_mesh(grid_m, bbox, a.model_width, a.z_exaggeration,
                             a.base, a.sea_level, overlay_m=overlay_m)
 
     if osm_footprints is not None:
-        roof_tris = None
+        roof_tris, roof_h = None, None
         if lidar_roofs:
-            bh = cached_buildings(bbox, rows, cols, "surface", a.verbose, a.no_cache)
-            bh = np.where(bh < 1.0, 0.0, bh)
+            roof_h = cached_buildings(bbox, rows, cols, "surface",
+                                      a.verbose, a.no_cache)
+            roof_h = np.where(roof_h < 1.0, 0.0, roof_h)
             print("Building LiDAR roof surface ...")
             roof_tris, _ = build_mesh(grid_m, bbox, a.model_width,
                                       a.z_exaggeration, a.base, a.sea_level,
-                                      overlay_m=bh)
+                                      overlay_m=roof_h)
         tris = add_osm_buildings(
             tris, info, bbox, osm_footprints,
             a.building_level_height, a.building_default_height,
             a.building_exaggeration, a.building_min_area, a.building_simplify,
-            roof_surface_tris=roof_tris)
+            roof_surface_tris=roof_tris, roof_h_m=roof_h)
 
     if a.emboss_coords:
         tris = emboss_corner_coords(tris, info, bbox, a.emboss_height,
@@ -1449,7 +1446,6 @@ def main(argv=None):
         "elev_m_per_mm": round(info["m_per_mm"], 4),   # for the viewer's contour lines
         "base_mm": a.base,
         "smooth": round(sigma, 2),
-        "peak_smooth": a.peak_smooth or None,
         "buildings": (a.building_source if a.buildings else None),
         "building_exaggeration": (a.building_exaggeration if a.buildings else None),
         "trees": bool(a.trees),
@@ -1462,6 +1458,16 @@ def main(argv=None):
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False),
                          encoding="utf-8")
     print(f"Wrote {meta_path}")
+
+    if credit:                       # ready-to-include credit sheet for sharing
+        notice = out.with_name(out.stem + ".CREDITS.txt")
+        notice.write_text(
+            f"{out.name}\nGenerated with topo2stl - {min_lat:.5f},{min_lon:.5f} "
+            f"to {max_lat:.5f},{max_lon:.5f}\n\n{credit}\n\n"
+            "topo2stl (the software) is MIT-licensed. This project is not "
+            "affiliated with or endorsed by the data providers.\n",
+            encoding="utf-8")
+        print(f"Wrote {notice}")
 
     if a.view:
         launch_viewer(out)
