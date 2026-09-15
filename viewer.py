@@ -23,6 +23,7 @@ import sys
 import threading
 import webbrowser
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 PORT = 8731
 TOPO2STL = Path(__file__).with_name("topo2stl.py")
@@ -33,7 +34,8 @@ _AREA_OPTS = {"--bbox": True, "--center": True, "--width-km": True,
               "--height-km": True, "-o": True, "--output": True,
               "--view": False, "--no-open": False}
 
-_regen = {"running": False, "done": False, "error": None, "log": ""}
+_regen = {"running": False, "done": False, "error": None, "log": "",
+          "saved_as": None}
 _regen_lock = threading.Lock()
 _numpy_ok = None
 
@@ -52,6 +54,17 @@ def _have_numpy() -> bool:
 
 def _sidecar(stl: Path) -> Path:
     return stl.with_name(stl.stem + ".topo.json")
+
+
+def _target_from_name(name: str) -> Path:
+    """Turn a user-typed 'save as' filename into a sibling path of the
+    current model - strips any directory component and enforces .stl."""
+    name = Path(name).name.strip()
+    if not name or name in (".", ".."):
+        raise ValueError("empty filename")
+    if not name.lower().endswith(".stl"):
+        name += ".stl"
+    return Handler.stl_path.parent / name
 
 
 def _regen_available():
@@ -97,13 +110,17 @@ def _area_args(argv, bbox):
     return ["--bbox", ",".join(f"{v:.6f}" for v in bbox)]
 
 
-def _run_regen(bbox):
+def _run_regen(bbox, target: Path | None = None):
+    """Re-run topo2stl for `bbox`. Overwrites the current model by default;
+    if `target` is given (a "save as"), writes there instead and, on
+    success, retargets the viewer to the new file."""
     stl = Handler.stl_path
+    out_path = target or stl
     try:
         meta = json.loads(_sidecar(stl).read_text())
         argv = meta["argv"]
         cmd = [sys.executable, str(TOPO2STL), *_area_args(argv, bbox),
-               *_strip_area_args(argv), "-o", str(stl)]
+               *_strip_area_args(argv), "-o", str(out_path)]
         with _regen_lock:
             _regen["log"] = "$ " + " ".join(cmd) + "\n\n"
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
@@ -114,10 +131,13 @@ def _run_regen(bbox):
                 _regen["log"] += line
         rc = proc.wait()
         err = None if rc == 0 else f"topo2stl exited with code {rc}"
+        if err is None and target is not None:
+            Handler.stl_path = target
     except Exception as e:                    # noqa: BLE001
         err = f"{type(e).__name__}: {e}"
     with _regen_lock:
-        _regen.update(running=False, done=True, error=err)
+        _regen.update(running=False, done=True, error=err,
+                       saved_as=(str(target) if target and not err else None))
 
 _PAGE_FILE = Path(__file__).with_name("viewer.html")
 
@@ -172,6 +192,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif p == "/regen/status":
                 with _regen_lock:
                     self._send(json.dumps(_regen).encode(), "application/json")
+            elif p == "/exists":
+                qs = parse_qs(urlparse(self.path).query)
+                name = (qs.get("name") or [""])[0]
+                try:
+                    exists = _target_from_name(name).exists() if name else False
+                except ValueError:
+                    exists = False
+                self._send(json.dumps({"exists": exists}).encode(),
+                           "application/json")
             else:
                 self._send(b"not found", "text/plain", 404)
         except OSError:
@@ -193,12 +222,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            "application/json", 400)
                 return
             try:
-                bb = [float(x) for x in json.loads(body)["bbox"]]
+                data = json.loads(body)
+                bb = [float(x) for x in data["bbox"]]
                 assert len(bb) == 4
                 assert bb[0] < bb[2] and bb[1] < bb[3]
                 assert -85 <= bb[0] and bb[2] <= 85 and -180 <= bb[1] and bb[3] <= 180
+                target = _target_from_name(data["filename"]) if data.get("filename") else None
             except Exception as e:                       # noqa: BLE001
-                self._send(json.dumps({"error": f"bad bbox: {e}"}).encode(),
+                self._send(json.dumps({"error": f"bad request: {e}"}).encode(),
                            "application/json", 400)
                 return
             with _regen_lock:
@@ -206,8 +237,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._send(b'{"error":"a regenerate is already running"}',
                                "application/json", 409)
                     return
-                _regen.update(running=True, done=False, error=None, log="")
-            threading.Thread(target=_run_regen, args=(bb,), daemon=True).start()
+                _regen.update(running=True, done=False, error=None, log="",
+                               saved_as=None)
+            threading.Thread(target=_run_regen, args=(bb, target), daemon=True).start()
             self._send(b'{"started":true}', "application/json")
         else:
             self._send(b"not found", "text/plain", 404)

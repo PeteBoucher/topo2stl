@@ -28,8 +28,10 @@ Loose list of things to do, roughly in priority order.
   - [ ] `--landmark "lat,lon,file.stl"` — drop a custom monument mesh.
   - [ ] Water mask — recess rivers/coast as a channel (Micropolitan style).
 - **viewer Area picker follow-ups** — done: pan/zoom bbox + Regenerate in the
-  viewer. Next: drag the blue rect directly; a 2D map thumbnail; remember the
-  panel state; `--replace` so the CLI `--view` re-runs don't orphan servers.
+  viewer; **Save as** to build the pending area to a new named file instead of
+  overwriting the current one. Next: drag the blue rect directly; a 2D map
+  thumbnail; remember panel state (pend/camera) across a page reload;
+  `--replace` so the CLI `--view` re-runs don't orphan servers.
 - **viewer.py lifecycle** — `--view` starts the server detached
   (`start_new_session=True`) so it outlives the shell and a later
   `viewer.py X.stl` just hits "port busy". Add:
