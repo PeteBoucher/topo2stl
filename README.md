@@ -121,6 +121,12 @@ the new extent over the model) and **Regenerate STL** — the viewer re-runs
 log, and reloads. Needs the venv Python (numpy) and `topo2stl.py` beside
 `viewer.py`; models built before this need one rebuild from the CLI first.
 
+Panned or zoomed to a framing you want to keep without losing the model
+currently on screen? Type a name and hit **Save as** instead — it builds the
+pending area to a new file next to the current one (asking first if that name
+already exists) and switches the viewer over to it, leaving the original STL
+untouched.
+
 Each `topo2stl.py` run writes a small `<name>.topo.json` sidecar next to the STL
 (bounding box, settings, and the command line, for the viewer's Regenerate).
 It's harmless to delete; slicers ignore it.
