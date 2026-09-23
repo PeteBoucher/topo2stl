@@ -42,6 +42,7 @@ Section dividers in the file (`grep -n "^# ---" topo2stl.py` to relocate):
 | 1512-1539 | `launch_viewer` | Starts or retargets `viewer.py` for `--view`. |
 
 ### Why one file
+
 `topo2stl.py` is intentionally not split into modules — it's a single-purpose
 CLI script, not a library. Don't propose a package refactor unless asked.
 
@@ -87,6 +88,7 @@ CLI script, not a library. Don't propose a package refactor unless asked.
 ## Cache directory (`cache/`)
 
 Filename pattern: `{kind}_{method?}_v{CACHE_VERSION}_{rows}x{cols}_{hash16}.npy`
+
 - `grid_ign_v1_...` / `grid_tessadem_v1_...` — elevation (`cached_grid`, topo2stl.py:553).
 - `buildings_surface_v1_...` / `buildings_classified_v1_...` — `cached_buildings` (585).
 - `veg_v1_...` — `cached_veg` (602).
@@ -118,7 +120,7 @@ else round-trips via the stored `argv` untouched.
 | --- | --- | --- |
 | GET | `/` | Serves `viewer.html` (viewer.py:145-151, reads the file fresh each time). |
 | GET | `/name` | Current STL filename. |
-| GET | `/version` | `"<mtime_ns>|<name>"` — polled by the page to detect file changes/switches. |
+| GET | `/version` | `"<mtime_ns>\|<name>"` — polled by the page to detect file changes/switches. |
 | GET | `/model.stl` | The STL bytes. |
 | GET | `/meta` | The `.topo.json` sidecar (bbox, m_per_mm, etc), or `{}`. |
 | GET | `/regen/available` | Whether Regenerate/Save-as can run (needs `topo2stl.py` beside `viewer.py`, a sidecar with `argv`, and numpy) — `_regen_available()`, viewer.py:70. |
