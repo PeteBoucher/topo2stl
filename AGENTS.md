@@ -3,19 +3,19 @@
 Purpose-built index for coding agents working in this repo. Read this instead
 of the whole source when you just need to find where something lives — it
 gives file:line ranges and one-line purposes so you can jump straight to the
-relevant 20-50 lines instead of loading all of `topo2stl.py` (1543 lines).
+relevant 20-50 lines instead of loading all of `topo2stl.py` (~1911 lines).
 For CLI usage / user-facing behaviour, read [README.md](README.md) instead —
 this file is about *where code is*, not how to run it.
 
-Line numbers are accurate as of commit `e32a92d`. If a grep for a symbol
-below doesn't match, the file has moved on — re-grep rather than trusting
-the stale number.
+Line numbers are accurate as of the `--tile` (multi-tile printing) commit. If
+a grep for a symbol below doesn't match, the file has moved on — re-grep
+rather than trusting the stale number.
 
 ## Repo layout
 
 | File | Lines | Role |
 | --- | --- | --- |
-| [topo2stl.py](topo2stl.py) | ~1543 | Everything: CLI, download, cache, mesh build, buildings, emboss, STL write. Single file by design — see "Why one file" below. |
+| [topo2stl.py](topo2stl.py) | ~1911 | Everything: CLI, download, cache, mesh build, buildings, emboss, tiling, STL write. Single file by design — see "Why one file" below. |
 | [viewer.py](viewer.py) | ~283 | stdlib-only HTTP server: serves `viewer.html`, the STL, the `.topo.json` sidecar, and a `/regen` endpoint that shells out to `topo2stl.py`. |
 | [viewer.html](viewer.html) | ~660 | The viewer's page: three.js render loop, HUD, Area pan/zoom panel, regen/save-as UI. All JS is inline in this one file. |
 | [docs/buildings-scope.md](docs/buildings-scope.md) | — | Design notes for the buildings feature (why OSM vs raster, etc). Background reading, not code. |
@@ -35,11 +35,12 @@ Section dividers in the file (`grep -n "^# ---" topo2stl.py` to relocate):
 | 326-549 | OSM buildings (Overpass) | `_stitch_rings` (join way fragments into closed rings for multipolygon relations), `fetch_osm` → `(buildings, water)`, `_building_height_m` (tag → metres logic), `_poly_area`, `_simplify`, `_clip_rect` (Sutherland-Hodgman clip to base plate), `_rasterize_polys`. |
 | 552-618 | Cache dispatch | `cached_grid`, `cached_buildings`, `cached_veg` — hash the request params (bbox rounded to 6dp + rows/cols/method/`CACHE_VERSION`) to a `.npy` filename under `cache/`. |
 | 621-666 | Grid smoothing | `gaussian_blur`, `_morph` (erode/dilate), `clip_peaks` (the `--peak-smooth` morphological-opening blend). |
-| 669-767 | Mesh construction | `build_mesh` — the core: grid → watertight solid (top surface + 4 walls + bottom), `quad` closure inside it, `_box_tris`. |
-| 770-1195 | Embossed corner coordinates | `_FONT5x7` (pixel font data), `_text_pixel_boxes`, `_have_manifold`/`_soup_to_manifold`/`_manifold_to_soup` (manifold3d bridge), `add_osm_buildings` (extrude + union footprints, optional LiDAR roof clipping), `_boolean_text`, `_fmt_lat`/`_fmt_lon`, `emboss_corner_coords`, `data_attribution` (credit-line text), `write_binary_stl`. |
-| 1198-1306 | CLI | `parse_args` — every `--flag` definition. |
-| 1309-1510 | `main()` | The pipeline glue — see "main() pipeline order" below. |
-| 1512-1539 | `launch_viewer` | Starts or retargets `viewer.py` for `--view`. |
+| 669-797 | Mesh construction | `_grid_to_z_mm` (elevation m → model-Z mm, lifted so the lowest point sits at `base_mm` — pure per-cell math, no geometry), `_mesh_from_z` (X/Y/Z arrays → watertight triangle soup: top + 4 walls + bottom), `build_mesh` (thin wrapper composing the two for the single-file path — kept so existing callers/behaviour are untouched). |
+| 800-1112 | Multi-tile printing | `_split_range` (axis samples → per-tile index ranges sharing a boundary sample), `_peg_positions`, `_cyl_tris` (arbitrary-axis frustum soup), `_tile_seam_geoms` (peg/socket specs for one tile's neighbours), `_apply_tile_keys` (union pegs / cut sockets via manifold3d), `_emboss_tile_label` (row-col ID on the south wall), `_footprints_in_bbox` (cheap pre-filter), `write_tiles` (the orchestrator: slices one global Z field per `--tile` ROWSxCOLS, keys+labels+writes each tile). See "Multi-tile printing" in README for the design. |
+| 1115-1540 | Embossed corner coordinates | `_FONT5x7` (pixel font data), `_text_pixel_boxes`, `_have_manifold`/`_soup_to_manifold`/`_manifold_to_soup` (manifold3d bridge — also used by tiling and OSM buildings), `add_osm_buildings` (extrude + union footprints, optional LiDAR roof clipping), `_boolean_text`, `_fmt_lat`/`_fmt_lon`, `emboss_corner_coords`, `data_attribution` (credit-line text), `write_binary_stl`. |
+| 1543-1667 | CLI | `parse_args` — every `--flag` definition. |
+| 1669-1878 | `main()` | The pipeline glue — see "main() pipeline order" below. |
+| 1880-1907 | `launch_viewer` | Starts or retargets `viewer.py` for `--view`. |
 
 ### Why one file
 
@@ -59,31 +60,35 @@ CLI script, not a library. Don't propose a package refactor unless asked.
   in millimetres, model sitting on `z = 0`. This is the STL soup passed
   between mesh-building stages (`build_mesh` → `add_osm_buildings` →
   `emboss_corner_coords` → `write_binary_stl`).
-- **`info` dict** (returned by `build_mesh`) carries `m_per_mm` and corner
-  coordinates forward to the buildings/emboss stages — grep `info\[` if you
-  need its exact keys.
+- **`info` dict** (returned by `build_mesh`/`_mesh_from_z`) carries `m_per_mm`
+  and corner coordinates forward to the buildings/emboss stages — grep
+  `info\[` if you need its exact keys.
 - Buildings/trees are **never** touched by `--z-exaggeration` — only by
   their own `--building-exaggeration`/`--tree-exaggeration`. That's a
   deliberate product decision (README "Notes" under Buildings), not a bug.
 
-## main() pipeline order (topo2stl.py:1309-1510)
+## main() pipeline order (topo2stl.py:1669-1878)
 
-1. Resolve `bbox` from `--bbox` or `--center`+`--width-km` (1312-1328).
-2. Resolve `rows, cols` from `--grid` (1330-1343).
-3. Force `--ign-res 5` if buildings/trees/lidar-roofs need it (1348-1357).
-4. `cached_grid()` → `grid_m` (1362).
+1. Resolve `bbox` from `--bbox` or `--center`+`--width-km`.
+2. Resolve `rows, cols` from `--grid`.
+3. Force `--ign-res 5` if buildings/trees/lidar-roofs need it.
+4. `cached_grid()` → `grid_m`.
 5. Fetch OSM footprints/water and/or raster buildings/veg into `overlay_m` /
-   `osm_footprints` (1379-1418). Tree canopy over OSM water is zeroed here.
+   `osm_footprints`. Tree canopy over OSM water is zeroed here.
 6. `gaussian_blur` (`--smooth`) then `clip_peaks` (`--peak-smooth`) on
    `grid_m` — **terrain only, not overlays**, and applied *after* the cache
-   read so cached grids stay raw (1420-1437).
-7. `build_mesh()` → `tris, info` (1439).
-8. If OSM buildings: optionally build a second LiDAR-roof mesh and pass it
-   into `add_osm_buildings()` (1442-1456).
-9. If `--emboss-coords`: `emboss_corner_coords()` (1458-1461).
-10. Write STL + `.topo.json` sidecar (bbox, settings, **and `sys.argv`** so
-    the viewer can re-run for a new area) + `.CREDITS.txt` (1465-1506).
-11. `--view` → `launch_viewer()` (1508).
+   read so cached grids stay raw.
+7. If `--tile`: `write_tiles()` does its own steps 8-10 per tile (slicing one
+   shared `_grid_to_z_mm` field instead of calling `build_mesh` per tile) and
+   `main()` returns early — see "Multi-tile printing" in README.
+8. Otherwise: `build_mesh()` → `tris, info`.
+9. If OSM buildings: optionally build a second LiDAR-roof mesh and pass it
+   into `add_osm_buildings()`.
+10. If `--emboss-coords`: `emboss_corner_coords()`.
+11. Write STL + `.topo.json` sidecar (bbox, settings, **and `sys.argv`** so
+    the viewer can re-run for a new area) + `.CREDITS.txt`.
+12. `--view` → `launch_viewer()` (tiling prints a note instead — there's no
+    single STL to preview).
 
 ## Cache directory (`cache/`)
 
@@ -103,11 +108,12 @@ Filename pattern: `{kind}_{method?}_v{CACHE_VERSION}_{rows}x{cols}_{hash16}.npy`
 
 ## Adding or changing a CLI flag — 3 places, always
 
-1. `parse_args()` (topo2stl.py:1199-1306) — the `argparse` definition.
-2. `main()` (1309-1510) — actually consume `a.<flag>`, and if it's worth
-   regenerating from (viewer's Regenerate button), it's already covered
-   automatically since the sidecar stores raw `sys.argv`.
-3. `README.md` "Key options" table (README.md:73-98) — user-facing docs.
+1. `parse_args()` (topo2stl.py:1543-1667) — the `argparse` definition.
+2. `main()` (1669-1878) — actually consume `a.<flag>` (and, for a `--tile-*`
+   flag, `write_tiles()` too), and if it's worth regenerating from (viewer's
+   Regenerate button), it's already covered automatically since the sidecar
+   stores raw `sys.argv`.
+3. `README.md` "Key options" table — user-facing docs.
 
 If the flag should survive a viewer-triggered regenerate with a *new area*
 (different `--bbox`/`--center`), also check `viewer.py`'s `_AREA_OPTS`
@@ -165,21 +171,34 @@ row: Fit/Relief/Wireframe/Spin/Coords/Area), `#area` (pan/zoom panel),
 | Change terrain smoothing behaviour | `gaussian_blur`/`clip_peaks`, topo2stl.py:622-666, and the `--smooth auto` sigma formula in `main()` around topo2stl.py:1422-1429 |
 | Change what's embossed / font | `_FONT5x7` + `_text_pixel_boxes` + `emboss_corner_coords`, topo2stl.py:771-1150 |
 | Add a new elevation source | Mirror the `download_grid_ign`/`download_grid` pair + add a `cached_grid` branch (topo2stl.py:553) + a `--source` choice (parse_args) |
-| Change STL header / credits text | `data_attribution`, topo2stl.py:1150 |
-| Change the sidecar `.topo.json` schema | `meta = {...}` dict in `main()`, topo2stl.py:1475-1491 — remember `viewer.py` reads `meta["argv"]` and `meta["bbox"]` specifically |
+| Change STL header / credits text | `data_attribution`, topo2stl.py:1495 |
+| Change the sidecar `.topo.json` schema | `meta = {...}` dict in `main()` — remember `viewer.py` reads `meta["argv"]` and `meta["bbox"]` specifically; `write_tiles()` builds its own (smaller) per-tile `meta` dict, keep the two in sync |
+| Change the peg/socket seam keying (size, spacing, which walls carry pegs) | `_tile_seam_geoms`, topo2stl.py:863 — the convention ("pegs on south/east, sockets on north/west") is asserted in that function's neighbour checks, not documented elsewhere in code |
+| Change tile splitting / bed-size check | `_split_range` + the bed check loop in `write_tiles`, topo2stl.py:809, 944 |
 | Change viewer Regenerate/Save-as behaviour | `_run_regen`/`_area_args`/`_strip_area_args`, viewer.py:84-141, and `startRegen`/`pollRegen` in viewer.html:509-546 |
 | Change the Area pan/zoom panel UI | viewer.html `#area` block (~104-119) + `refreshArea`/`panPend`/`zoomPend` (viewer.html:428-486) |
-| Known accepted limitations (don't "fix" without asking) | [BACKLOG.md](BACKLOG.md) "Known issues" — sharp-peak stringing, minor non-manifold edges on flat-roof unions |
+| Known accepted limitations (don't "fix" without asking) | [BACKLOG.md](BACKLOG.md) "Known issues" — sharp-peak stringing, minor non-manifold edges on flat-roof unions, a building footprint straddling a tile seam is clipped independently by each tile |
 
 ## Gotchas
 
-- `manifold3d` is optional (only needed for `--emboss-coords` and OSM
-  building union); `_have_manifold()` (topo2stl.py:847) gates it. Code paths
-  without it fall back to unioned/separate shells — check both branches when
-  touching boolean-op code.
+- `manifold3d` is optional for a plain terrain print (only needed for
+  `--emboss-coords` engraved text and OSM building union) but **mandatory**
+  for `--tile` (the peg/socket seam keys are CSG booleans) — `write_tiles()`
+  checks `_have_manifold()` up front and refuses to run without it. Elsewhere
+  `_have_manifold()` (topo2stl.py:1192) gates optional fallback paths
+  (unioned/separate shells) — check both branches when touching boolean-op
+  code outside `write_tiles`.
+- **Tiling shares one Z field on purpose.** `write_tiles()` calls
+  `_grid_to_z_mm` *once* on the whole (pre-split) grid and slices the result
+  per tile, rather than calling `build_mesh` per tile. Per-tile `build_mesh`
+  calls would each pick their own lowest point as the `base_mm` reference,
+  silently offsetting every tile's Z by a different amount — the seams would
+  no longer line up even though the elevation data is identical. If you
+  refactor `write_tiles`, keep the "one shared reference/lift, sliced after"
+  shape.
 - `--buildings`/`--trees`/`--building-roofs lidar` silently **force
   `--ign-res 5`** and require `--source ign` (raster methods and lidar roofs
-  are Spain-only) — see topo2stl.py:1348-1357. A "why is my grid 5m when I
+  are Spain-only) — see topo2stl.py:1706-1717. A "why is my grid 5m when I
   asked for defaults" bug report likely starts here.
 - `--smooth` and `--peak-smooth` run on the **decoded grid after the cache
   read**, never on what's stored in `cache/` — the cache is always raw

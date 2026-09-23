@@ -1,5 +1,5 @@
 numpy>=1.24
 requests>=2.28
 
-# only needed for --emboss-coords
+# needed for --emboss-coords (engraved), --building-source osm, and --tile
 manifold3d>=2.5

@@ -90,6 +90,7 @@ python topo2stl.py --bbox 36.98,-3.45,37.10,-3.28 --ign-res 5 \
 | `--building-min-area` / `--building-simplify` | osm: drop footprints under N m² (10); simplify tolerance in model mm (0.4). |
 | `--building-roofs` | osm: `flat` (default) or `lidar` — clip prisms to the real LiDAR roofscape (Spain). |
 | `--trees` | Add tree canopy from IGN's vegetation DSM (Spain). `--tree-exaggeration`, `--tree-min-height`. |
+| `--tile ROWSxCOLS` | Split the model into a grid of tiles that each fit `--bed-size`, keyed with peg/socket seams — see below. |
 | `--emboss-coords` | Engrave each side wall's edge coordinate (see below). |
 | `--emboss-style` | `engraved` (cut in, default — needs `manifold3d`) or `raised` (stands proud). |
 | `--emboss-height` / `--emboss-depth` | Text cap height (mm, default 4) and engraving/relief depth (mm, default 0.6). |
@@ -219,6 +220,49 @@ added as separate shells (slicers union them).
 
 A taller `--base` (4–6 mm) keeps the text on the flat plinth rather than the
 sloping terrain, so it prints crisply.
+
+---
+
+## Multi-tile printing
+
+`--tile ROWSxCOLS` splits a model too big for one print bed into a grid of
+tiles (e.g. `--tile 2x2`, `--tile 2x6`) that you glue together afterwards.
+`--model-width` describes the *whole assembled map*; `--tile` slices it up.
+
+```text
+topo2stl.py --bbox 37.83,-4.85,37.94,-4.71 --model-width 400 --tile 2x2 \
+            -o granada.stl
+```
+
+writes `granada_r1c1.stl` … `granada_r2c2.stl`, one `.topo.json` sidecar per
+tile, a shared `granada.CREDITS.txt`, and a `granada.tileset.json` manifest
+listing every tile's file, bbox and size.
+
+Two things keep the seams as invisible as possible:
+
+- **One elevation field, cut apart.** The whole area is downloaded, smoothed
+  and height-referenced *before* it's sliced into tiles, and adjacent tiles
+  share the exact sample column/row at their border. A seam is never a
+  resampling artifact or a different height-zero point between tiles — only
+  the physical print and glue-up have to be accurate.
+- **Peg/socket keys molded into the base.** Every internal seam gets a row of
+  tapered pegs and matching sockets cast into the base slab (hidden under the
+  terrain, `--tile-peg-diameter`/`--tile-peg-length`/`--tile-clearance`
+  control the fit). By convention each tile carries pegs on its **south and
+  east** walls and sockets on its **north and west** walls, keying into
+  whichever neighbour is on that side — row 1 is the northmost row, col 1 the
+  westmost column. `--base` is auto-raised if it's too thin to hold the pegs.
+
+Each tile is engraved with a small `row-col` tag (e.g. `1-2`) low on its
+south wall for sorting tiles before gluing — small and low enough to end up
+hidden against the table or the next tile once assembled. `--emboss-coords`
+still works per tile if you also want each tile's own corner coordinates.
+
+Needs `manifold3d` (for the peg/socket booleans) and each tile must fit
+`--bed-size` (default 220 mm, your bed's usable square) — topo2stl checks
+this up front and tells you to add more `--tile` rows/cols or shrink
+`--model-width` if not. A building footprint that straddles a seam is simply
+clipped by each tile it touches, like the base plate's own edge.
 
 ---
 

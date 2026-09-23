@@ -41,6 +41,20 @@ Loose list of things to do, roughly in priority order.
     on X.stl; make `topo2stl --view` use this so re-runs always land on the
     right file.
   - maybe `viewer.py --status` — print the running viewer's current STL.
+- **Multi-tile printing** — done: `--tile ROWSxCOLS` splits a model too big
+  for one bed into a grid of tiles cut from one continuous elevation field,
+  keyed with peg/socket seams molded into the base (`--bed-size`,
+  `--tile-peg-diameter/-length/-spacing`, `--tile-clearance`), plus a
+  `.tileset.json` manifest and a small row-col ID engraved low on each tile's
+  south wall. Next:
+  - viewer support for opening a whole tileset assembled in place (right now
+    `--view` after `--tile` just tells you to preview one tile file).
+  - drop the "one bare peg centred" fallback for a very short seam in favour
+    of a slightly larger minimum tile size check.
+  - a building footprint straddling a seam is clipped independently by each
+    tile it touches (like the base plate's edge) rather than split with a
+    matching cut on both sides - fine for most footprints, can leave a
+    visible mismatch for a building that spans most of a tile.
 - Optional hillshade / contour bake into the printed surface itself.
 - `--preset` shelf (e.g. `wall-tile`, `desk`, `keyring`) bundling size + base +
   exaggeration.

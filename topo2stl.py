@@ -667,37 +667,40 @@ def clip_peaks(grid: np.ndarray, strength: float, r: int = 2) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 # Mesh construction
 # --------------------------------------------------------------------------- #
-def build_mesh(grid_m: np.ndarray, bbox, model_width_mm: float,
-               z_exaggeration: float, base_mm: float,
-               z_from_sea_level: bool,
-               overlay_m: np.ndarray | None = None) -> np.ndarray:
-    """
-    grid_m: elevations in metres, [row0=north, col0=west].
-    overlay_m: optional height-above-ground (m) for raster buildings / trees,
-        same shape; added on top of the terrain surface *after* z-exaggeration
-        so it keeps true scale.
-    Returns an (n_tri, 3, 3) float32 array of triangle vertices.
+def _grid_to_z_mm(grid_m: np.ndarray, bbox, model_width_mm: float,
+                  z_exaggeration: float, base_mm: float,
+                  z_from_sea_level: bool):
+    """Elevations (m) -> model-Z (mm), lifted so the lowest point sits at
+    base_mm. Pure per-cell math - no mesh geometry - so it can be run once on
+    a whole multi-tile grid and then sliced per tile (see write_tiles), which
+    is what keeps a shared seam's Z values bit-identical between tiles rather
+    than each tile computing its own (different) lowest point.
+
+    Returns (z_mm, mm_per_m, model_h_mm).
     """
     min_lat, min_lon, max_lat, max_lon = bbox
-    rows, cols = grid_m.shape
     mean_lat = (min_lat + max_lat) / 2.0
-
     real_w_m = (max_lon - min_lon) * m_per_deg_lon(mean_lat)
     real_h_m = (max_lat - min_lat) * EARTH_M_PER_DEG_LAT
     mm_per_m = model_width_mm / real_w_m
     model_h_mm = real_h_m * mm_per_m
 
-    # X: west->east (col), Y: south->north, so flip rows (row0 is north)
-    xs = np.linspace(0.0, model_width_mm, cols)
-    ys = np.linspace(0.0, model_h_mm, rows)[::-1]
-
     base_ref = 0.0 if z_from_sea_level else float(np.min(grid_m))
     z = (grid_m - base_ref) * mm_per_m * z_exaggeration
     z = z - z.min() + base_mm            # lift so lowest surface point sits at base_mm
-    terrain_top_mm = float(z.max())
-    if overlay_m is not None:            # true-scale (not z-exaggerated) massing
-        z = z + overlay_m * mm_per_m
+    return z, mm_per_m, model_h_mm
 
+
+def _mesh_from_z(xs: np.ndarray, ys: np.ndarray, z: np.ndarray) -> np.ndarray:
+    """
+    xs: model-mm column positions (west->east), len cols.
+    ys: model-mm row positions (south->north, i.e. descending with row index
+        since row0=north), len rows.
+    z: model-Z in mm (rows, cols), row0=north. May already include overlays
+       (buildings/trees) added on top of the terrain.
+    Returns (tris, info) - see build_mesh.
+    """
+    rows, cols = z.shape
     X, Y = np.meshgrid(xs, ys)           # (rows, cols)
     top = np.stack([X, Y, z], axis=-1)   # (rows, cols, 3)
     bot = np.stack([X, Y, np.zeros_like(z)], axis=-1)
@@ -740,6 +743,45 @@ def build_mesh(grid_m: np.ndarray, bbox, model_width_mm: float,
         j = cols - 1
         quad(top[i + 1, j], bot[i + 1, j], bot[i, j], top[i, j])
 
+    info = {
+        "model_w": float(xs[-1] - xs[0]),
+        "model_h": float(ys[0] - ys[-1]),
+        # wall-top height (mm) sampled along each edge, ordered low coord -> high
+        "south_z": z[rows - 1].copy(),        # x: 0 -> W
+        "north_z": z[0].copy(),               # x: 0 -> W
+        "west_z": z[::-1, 0].copy(),          # y: 0 -> H
+        "east_z": z[::-1, cols - 1].copy(),   # y: 0 -> H
+        "z_mm": z.copy(),                     # full model-Z grid (mm), row0=north
+    }
+    return tris, info
+
+
+def build_mesh(grid_m: np.ndarray, bbox, model_width_mm: float,
+               z_exaggeration: float, base_mm: float,
+               z_from_sea_level: bool,
+               overlay_m: np.ndarray | None = None) -> np.ndarray:
+    """
+    grid_m: elevations in metres, [row0=north, col0=west].
+    overlay_m: optional height-above-ground (m) for raster buildings / trees,
+        same shape; added on top of the terrain surface *after* z-exaggeration
+        so it keeps true scale.
+    Returns an (n_tri, 3, 3) float32 array of triangle vertices.
+    """
+    rows, cols = grid_m.shape
+    real_w_m = (bbox[3] - bbox[1]) * m_per_deg_lon((bbox[0] + bbox[2]) / 2.0)
+    real_h_m = (bbox[2] - bbox[0]) * EARTH_M_PER_DEG_LAT
+
+    z, mm_per_m, model_h_mm = _grid_to_z_mm(
+        grid_m, bbox, model_width_mm, z_exaggeration, base_mm, z_from_sea_level)
+    terrain_top_mm = float(z.max())
+    if overlay_m is not None:            # true-scale (not z-exaggerated) massing
+        z = z + overlay_m * mm_per_m
+
+    # X: west->east (col), Y: south->north, so flip rows (row0 is north)
+    xs = np.linspace(0.0, model_width_mm, cols)
+    ys = np.linspace(0.0, model_h_mm, rows)[::-1]
+    tris, info = _mesh_from_z(xs, ys, z)
+
     print(f"Model: {model_width_mm:.1f} x {model_h_mm:.1f} mm, "
           f"{len(tris)} triangles")
     print(f"  ground sampling: ~{real_w_m/ (cols-1):.0f} m/px E-W, "
@@ -748,21 +790,324 @@ def build_mesh(grid_m: np.ndarray, bbox, model_width_mm: float,
           f"{terrain_top_mm-base_mm:.1f} mm  (exaggeration {z_exaggeration}x, "
           f"base {base_mm} mm)")
 
-    info = {
-        "model_w": model_width_mm,
-        "model_h": model_h_mm,
-        "base_mm": base_mm,
-        "m_per_mm": 1.0 / (mm_per_m * z_exaggeration),  # real elevation m per model-Z mm
-        "relief_mm": float(z.max() - z.min()),
-        # wall-top height (mm) sampled along each edge, ordered low coord -> high
-        "south_z": z[rows - 1].copy(),        # x: 0 -> W
-        "north_z": z[0].copy(),               # x: 0 -> W
-        "west_z": z[::-1, 0].copy(),          # y: 0 -> H
-        "east_z": z[::-1, cols - 1].copy(),   # y: 0 -> H
-        "z_mm": z.copy(),                     # full model-Z grid (mm), row0=north
-        "mm_per_m": mm_per_m,                 # model mm per real horizontal metre
-    }
+    info["base_mm"] = base_mm
+    info["m_per_mm"] = 1.0 / (mm_per_m * z_exaggeration)  # real elevation m per model-Z mm
+    info["relief_mm"] = float(z.max() - z.min())
+    info["mm_per_m"] = mm_per_m                 # model mm per real horizontal metre
     return tris, info
+
+
+# --------------------------------------------------------------------------- #
+# Multi-tile printing: split a model too big for the bed into a grid of
+# tiles, cut from one continuous elevation/Z field so a seam is never a
+# resampling or reference-height mismatch - only the physical print/assembly
+# has to be accurate. Each internal seam gets peg/socket keys molded into the
+# base slab (hidden under the terrain) so tiles register precisely: by
+# convention every tile carries pegs on its south and east walls, and sockets
+# on its north and west walls, matching the neighbour on that side.
+# --------------------------------------------------------------------------- #
+def _split_range(n_total: int, n_tiles: int, axis: str) -> list[tuple[int, int]]:
+    """n_total samples along one axis -> n_tiles (start, end) inclusive index
+    ranges, as equal as possible, each sharing its boundary sample with its
+    neighbour (end_i == start_{i+1}) so adjacent tiles' seam vertices are the
+    same array cell, not just numerically close."""
+    cells = n_total - 1
+    if cells < n_tiles:
+        raise SystemExit(f"--tile: grid too coarse to split into {n_tiles} "
+                         f"{axis} tiles ({n_total} samples) - raise --grid")
+    base, extra = divmod(cells, n_tiles)
+    starts = [0]
+    for k in range(n_tiles):
+        starts.append(starts[-1] + base + (1 if k < extra else 0))
+    return [(starts[k], starts[k + 1]) for k in range(n_tiles)]
+
+
+def _peg_positions(length_mm: float, spacing: float, margin: float) -> list[float]:
+    """Evenly spaced peg/socket centres along a seam of this length, inset
+    from both ends by `margin`; always at least one (centred if the seam is
+    too short for two)."""
+    margin = min(margin, length_mm / 2.0 - 1e-6)
+    usable = max(length_mm - 2 * margin, 0.0)
+    if usable <= 0:
+        return [length_mm / 2.0]
+    n = max(2, int(usable // spacing) + 1)
+    return [margin + usable * k / (n - 1) for k in range(n)]
+
+
+def _cyl_tris(center, axis, r0: float, r1: float, length: float,
+             segments: int = 16) -> list:
+    """Closed capped cylinder/frustum soup: a ring of radius r0 at `center`,
+    extruded `length` along the (not necessarily axis-aligned) unit vector
+    `axis` to a ring of radius r1."""
+    center = np.asarray(center, float)
+    axis = np.asarray(axis, float)
+    axis = axis / np.linalg.norm(axis)
+    ref = np.array([1.0, 0.0, 0.0]) if abs(axis[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = np.cross(axis, ref); u /= np.linalg.norm(u)
+    v = np.cross(axis, u)
+    ang = np.linspace(0.0, 2 * np.pi, segments, endpoint=False)
+    dirs = [c * u + s * v for c, s in zip(np.cos(ang), np.sin(ang))]
+    ring0 = [center + r0 * d for d in dirs]
+    ring1 = [center + axis * length + r1 * d for d in dirs]
+    top_c, bot_c = center + axis * length, center
+    tris = []
+    for i in range(segments):
+        j = (i + 1) % segments
+        tris.append((ring0[i], ring0[j], ring1[j]))
+        tris.append((ring0[i], ring1[j], ring1[i]))
+        tris.append((bot_c, ring0[j], ring0[i]))       # bottom cap, normal -axis
+        tris.append((top_c, ring1[i], ring1[j]))       # top cap, normal +axis
+    return tris
+
+
+def _tile_seam_geoms(ti: int, tj: int, trows: int, tcols: int,
+                     Wd: float, Hd: float, base_mm: float,
+                     peg_r: float, peg_len: float, clearance: float,
+                     spacing: float, margin: float):
+    """Peg/socket cylinder specs, in this tile's own local mm frame, for the
+    neighbours this tile actually has. Each spec is (center, axis, r0, r1,
+    length). Pegs taper 20% toward the tip for easy insertion; sockets are
+    straight and sized for the peg's widest (base) radius plus clearance."""
+    z = base_mm / 2.0
+    emb = 0.2                  # embed pegs / overshoot sockets past the wall
+                                # face so the CSG union/cut isn't a bare tangency
+    tip_r = peg_r * 0.8
+    sock_r = peg_r + clearance
+    sock_len = peg_len + 0.3   # a bit deeper than the peg so it never bottoms out
+
+    pegs, sockets = [], []
+    if tj < tcols - 1:                     # east neighbour -> pegs, east wall
+        for y in _peg_positions(Hd, spacing, margin):
+            pegs.append(((Wd - emb, y, z), (1, 0, 0), peg_r, tip_r, peg_len + emb))
+    if tj > 0:                             # west neighbour -> sockets, west wall
+        for y in _peg_positions(Hd, spacing, margin):
+            sockets.append(((-emb, y, z), (1, 0, 0), sock_r, sock_r, sock_len + emb))
+    if ti < trows - 1:                     # south neighbour -> pegs, south wall
+        for x in _peg_positions(Wd, spacing, margin):
+            pegs.append(((x, emb, z), (0, -1, 0), peg_r, tip_r, peg_len + emb))
+    if ti > 0:                             # north neighbour -> sockets, north wall
+        for x in _peg_positions(Wd, spacing, margin):
+            sockets.append(((x, Hd + emb, z), (0, -1, 0), sock_r, sock_r, sock_len + emb))
+    return pegs, sockets
+
+
+def _apply_tile_keys(tris, pegs: list, sockets: list) -> np.ndarray:
+    """Union the peg bumps and cut the socket holes into a tile's mesh."""
+    import manifold3d as m3d
+    base = _soup_to_manifold(tris)
+    if pegs:
+        peg_m = m3d.Manifold.batch_boolean(
+            [_soup_to_manifold(_cyl_tris(*spec)) for spec in pegs], m3d.OpType.Add)
+        base = base + peg_m
+    if sockets:
+        sock_m = m3d.Manifold.batch_boolean(
+            [_soup_to_manifold(_cyl_tris(*spec)) for spec in sockets], m3d.OpType.Add)
+        base = base - sock_m
+    if base.is_empty():
+        raise SystemExit("tile keying boolean produced an empty mesh")
+    return _manifold_to_soup(base)
+
+
+def _emboss_tile_label(tris, info: dict, label: str) -> np.ndarray:
+    """Engrave a small "row-col" tag at the SW corner of the south wall, low
+    on the base so it always fits (the base slab is at least as tall as the
+    pegs need). It ends up hidden against the table or the next tile once
+    tiles are assembled - it's there for sorting tiles before gluing."""
+    W = info["model_w"]
+    cap_mm, depth, margin = 3.0, 0.5, 3.0
+    n_px = len(label) * _GLYPH_ADV - 1
+    px = min(cap_mm / _GLYPH_H, (W - 2 * margin) / max(n_px, 1))
+    if px <= 0:
+        return np.asarray(tris, dtype=np.float32)
+    boxes = _text_pixel_boxes(label, (margin, 0.0, 0.3), (1, 0, 0), (0, 0, 1),
+                              (0, -1, 0), px, out_mm=0.4, in_mm=depth)
+    return _boolean_text(tris, boxes, "sub")
+
+
+def _footprints_in_bbox(footprints: list, bbox, pad_deg: float = 0.001) -> list:
+    """Cheap pre-filter (bbox-vs-bbox) before handing footprints to
+    add_osm_buildings, which does the real per-tile clip - avoids redoing
+    CSG work for buildings nowhere near this tile."""
+    min_lat, min_lon, max_lat, max_lon = bbox
+    out = []
+    for fp in footprints:
+        lons = [p[0] for p in fp["outer"]]
+        lats = [p[1] for p in fp["outer"]]
+        if max(lons) < min_lon - pad_deg or min(lons) > max_lon + pad_deg:
+            continue
+        if max(lats) < min_lat - pad_deg or min(lats) > max_lat + pad_deg:
+            continue
+        out.append(fp)
+    return out
+
+
+def write_tiles(a, bbox, grid_m: np.ndarray, overlay_m, osm_footprints,
+                lidar_roofs: bool, out: Path, credit: str, stl_header: str):
+    """Split the model into a's --tile ROWSxCOLS grid and write one STL (plus
+    sidecar meta) per tile, keyed together with peg/socket seams."""
+    if not _have_manifold():
+        raise SystemExit("--tile needs manifold3d (for the peg/socket seam "
+                         "keys):\n  ./.venv/bin/pip install -r requirements.txt")
+
+    trows, tcols = (int(v) for v in a.tile.lower().split("x"))
+    if trows < 1 or tcols < 1:
+        raise SystemExit("--tile needs positive ROWSxCOLS, e.g. 2x2")
+
+    min_lat, min_lon, max_lat, max_lon = bbox
+    rows, cols = grid_m.shape
+
+    # base slab must be thick enough to hold the pegs with a margin top/bottom
+    min_base = a.tile_peg_diameter + 3.0
+    if a.base < min_base:
+        print(f"Bumping --base to {min_base:.1f} mm so the "
+              f"{a.tile_peg_diameter:.1f} mm keying pegs fit in the base slab")
+        a.base = min_base
+
+    z_terrain, mm_per_m, model_h_mm = _grid_to_z_mm(
+        grid_m, bbox, a.model_width, a.z_exaggeration, a.base, a.sea_level)
+    z_main = z_terrain + overlay_m * mm_per_m if overlay_m is not None else z_terrain
+
+    roof_h = None
+    if lidar_roofs:
+        roof_h = cached_buildings(bbox, rows, cols, "surface", a.verbose, a.no_cache)
+        roof_h = np.where(roof_h < 1.0, 0.0, roof_h)
+        z_roof = z_terrain + roof_h * mm_per_m
+
+    xs_global = np.linspace(0.0, a.model_width, cols)
+    ys_global = np.linspace(0.0, model_h_mm, rows)[::-1]
+    row_ranges = _split_range(rows, trows, "row")
+    col_ranges = _split_range(cols, tcols, "col")
+
+    peg_r = a.tile_peg_diameter / 2.0
+    margin = max(10.0, 2.0 * a.tile_peg_diameter)
+
+    # bed-size check up front, before doing any real work
+    for ti, (r0, r1) in enumerate(row_ranges):
+        for tj, (c0, c1) in enumerate(col_ranges):
+            tw = xs_global[c1] - xs_global[c0]
+            th = ys_global[r0] - ys_global[r1]
+            if tw > a.bed_size + 1e-6 or th > a.bed_size + 1e-6:
+                raise SystemExit(
+                    f"tile [{ti + 1},{tj + 1}] is {tw:.1f} x {th:.1f} mm, "
+                    f"bigger than --bed-size {a.bed_size:.1f} mm - add more "
+                    f"--tile rows/cols or shrink --model-width")
+
+    print(f"Tiling: {trows}x{tcols} tiles, bed limit {a.bed_size:.0f} mm, "
+          f"base bumped to {a.base:.1f} mm for {a.tile_peg_diameter:.1f} mm pegs")
+    print("Tile layout (row-col), north=up, row 1 = north, col 1 = west:")
+    for ti in range(trows):
+        print("  " + "  ".join(f"[{ti + 1}-{tj + 1}]" for tj in range(tcols)))
+    print("  pegs on each tile's south/east walls key into sockets on its "
+          "north/west neighbour; each tile is tagged \"row-col\" low on its "
+          "south wall for sorting before gluing.")
+
+    manifest_tiles = []
+    for ti, (r0, r1) in enumerate(row_ranges):
+        for tj, (c0, c1) in enumerate(col_ranges):
+            xs = xs_global[c0:c1 + 1] - xs_global[c0]
+            ys = ys_global[r0:r1 + 1] - ys_global[r1]
+            z_tile = z_main[r0:r1 + 1, c0:c1 + 1]
+            tris, info = _mesh_from_z(xs, ys, z_tile)
+            info["mm_per_m"] = mm_per_m
+            info["base_mm"] = a.base
+            Wd, Hd = info["model_w"], info["model_h"]
+
+            tile_bbox = (
+                max_lat - r1 / (rows - 1) * (max_lat - min_lat),
+                min_lon + c0 / (cols - 1) * (max_lon - min_lon),
+                max_lat - r0 / (rows - 1) * (max_lat - min_lat),
+                min_lon + c1 / (cols - 1) * (max_lon - min_lon),
+            )
+
+            label = f"{ti + 1}-{tj + 1}"
+            print(f"Tile {label}: {Wd:.1f} x {Hd:.1f} mm, {len(tris)} triangles")
+
+            if osm_footprints is not None:
+                fp = _footprints_in_bbox(osm_footprints, tile_bbox)
+                roof_tris_tile, roof_h_tile = None, None
+                if lidar_roofs:
+                    roof_h_tile = roof_h[r0:r1 + 1, c0:c1 + 1]
+                    roof_tris_tile, _ = _mesh_from_z(xs, ys, z_roof[r0:r1 + 1, c0:c1 + 1])
+                tris = add_osm_buildings(
+                    tris, info, tile_bbox, fp,
+                    a.building_level_height, a.building_default_height,
+                    a.building_exaggeration, a.building_min_area,
+                    a.building_simplify,
+                    roof_surface_tris=roof_tris_tile, roof_h_m=roof_h_tile)
+
+            pegs, sockets = _tile_seam_geoms(
+                ti, tj, trows, tcols, Wd, Hd, a.base, peg_r,
+                a.tile_peg_length, a.tile_clearance, a.tile_peg_spacing, margin)
+            if pegs or sockets:
+                tris = _apply_tile_keys(tris, pegs, sockets)
+
+            tris = _emboss_tile_label(tris, info, label)
+            if a.emboss_coords:
+                tris = emboss_corner_coords(tris, info, tile_bbox, a.emboss_height,
+                                            a.emboss_depth, a.emboss_decimals,
+                                            a.emboss_style)
+            tris = np.asarray(tris, dtype=np.float32)
+
+            tile_path = out.with_name(f"{out.stem}_r{ti + 1}c{tj + 1}{out.suffix}")
+            write_binary_stl(tris, tile_path, stl_header)
+
+            meta = {
+                "bbox": list(tile_bbox),
+                "source": a.source + (f" MDT{a.ign_res:02d}" if a.source == "ign" else ""),
+                "z_exaggeration": a.z_exaggeration,
+                "grid": [r1 - r0 + 1, c1 - c0 + 1],
+                "elev_m_per_mm": round(1.0 / (mm_per_m * a.z_exaggeration), 4),
+                "base_mm": a.base,
+                "buildings": (a.building_source if a.buildings else None),
+                "trees": bool(a.trees),
+                "generator": "topo2stl",
+                "attribution": credit,
+                "argv": list(sys.argv[1:]),
+                "model_width": Wd,
+                "tile": {"row": ti + 1, "col": tj + 1, "grid": [trows, tcols],
+                         "label": label},
+            }
+            tile_path.with_name(tile_path.stem + ".topo.json").write_text(
+                json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+
+            manifest_tiles.append({
+                "row": ti + 1, "col": tj + 1, "label": label,
+                "file": tile_path.name, "bbox": list(tile_bbox),
+                "width_mm": Wd, "height_mm": Hd,
+            })
+
+    manifest = {
+        "generator": "topo2stl",
+        "bbox": [min_lat, min_lon, max_lat, max_lon],
+        "tile_grid": [trows, tcols],
+        "bed_size_mm": a.bed_size,
+        "assembled_width_mm": a.model_width,
+        "assembled_height_mm": float(model_h_mm),
+        "peg_diameter_mm": a.tile_peg_diameter,
+        "peg_length_mm": a.tile_peg_length,
+        "clearance_mm": a.tile_clearance,
+        "assembly": "row 1 = north, col 1 = west. Each tile carries pegs on "
+                    "its south/east walls and sockets on its north/west "
+                    "walls, matching the neighbour on that side. Each tile "
+                    "is tagged 'row-col' low on its south wall.",
+        "attribution": credit,
+        "tiles": manifest_tiles,
+    }
+    manifest_path = out.with_name(out.stem + ".tileset.json")
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False),
+                             encoding="utf-8")
+    print(f"Wrote {len(manifest_tiles)} tiles + {manifest_path}")
+
+    if credit:
+        notice = out.with_name(out.stem + ".CREDITS.txt")
+        notice.write_text(
+            f"{out.stem} - {trows}x{tcols} tile set\nGenerated with topo2stl - "
+            f"{min_lat:.5f},{min_lon:.5f} to {max_lat:.5f},{max_lon:.5f}\n\n"
+            f"{credit}\n\ntopo2stl https://github.com/PeteBoucher/topo2stl "
+            "(the software) is MIT-licensed. This project is not affiliated "
+            "with or endorsed by the data providers.\n",
+            encoding="utf-8")
+        print(f"Wrote {notice}")
 
 
 # --------------------------------------------------------------------------- #
@@ -1280,6 +1625,21 @@ def parse_args(argv=None):
     p.add_argument("--tree-min-height", type=float, default=2.0,
                    help="drop vegetation cells below this many metres")
 
+    p.add_argument("--tile", help="ROWSxCOLS - split the model into a grid "
+                        "of tiles that each fit --bed-size, cut from one "
+                        "continuous elevation field and keyed together with "
+                        "peg/socket seams molded into the base (e.g. 2x2, 2x6)")
+    p.add_argument("--bed-size", type=float, default=220.0,
+                   help="usable print-bed size in mm (square) each tile must fit")
+    p.add_argument("--tile-peg-diameter", type=float, default=5.0,
+                   help="tile seam keying peg diameter in mm (base of the taper)")
+    p.add_argument("--tile-peg-length", type=float, default=3.0,
+                   help="tile seam keying peg protrusion length in mm")
+    p.add_argument("--tile-peg-spacing", type=float, default=45.0,
+                   help="target spacing in mm between keying pegs along a seam")
+    p.add_argument("--tile-clearance", type=float, default=0.15,
+                   help="peg/socket fit clearance in mm per side")
+
     p.add_argument("--emboss-coords", action="store_true",
                    help="mark each side wall with its edge coordinate (latitude "
                         "on N/S walls, longitude on E/W), anchored at the SW/NE "
@@ -1436,6 +1796,19 @@ def main(argv=None):
         print(f"Rounded peaks (strength {a.peak_smooth}): summit dropped "
               f"{before - grid_m.max():.1f} m")
 
+    out = Path(a.output) if a.output else Path(
+        f"topo_{min_lat:.3f}_{min_lon:.3f}_{rows}x{cols}.stl")
+    credit, stl_header = data_attribution(
+        a.source, a.ign_res, (a.buildings or a.trees),
+        osm=(a.buildings and a.building_source == "osm"))
+
+    if a.tile:
+        write_tiles(a, bbox, grid_m, overlay_m, osm_footprints, lidar_roofs,
+                   out, credit, stl_header)
+        if a.view:
+            print("  note: --view shows a single STL; pick one tile file to preview")
+        return
+
     tris, info = build_mesh(grid_m, bbox, a.model_width, a.z_exaggeration,
                             a.base, a.sea_level, overlay_m=overlay_m)
 
@@ -1462,11 +1835,6 @@ def main(argv=None):
     else:
         tris = np.asarray(tris, dtype=np.float32)
 
-    out = Path(a.output) if a.output else Path(
-        f"topo_{min_lat:.3f}_{min_lon:.3f}_{rows}x{cols}.stl")
-    credit, stl_header = data_attribution(
-        a.source, a.ign_res, (a.buildings or a.trees),
-        osm=(a.buildings and a.building_source == "osm"))
     write_binary_stl(tris, out, stl_header)
     if credit:
         print(f"  attribution (required if published/sold): {credit}")
@@ -1499,8 +1867,9 @@ def main(argv=None):
         notice.write_text(
             f"{out.name}\nGenerated with topo2stl - {min_lat:.5f},{min_lon:.5f} "
             f"to {max_lat:.5f},{max_lon:.5f}\n\n{credit}\n\n"
-            "topo2stl (the software) is MIT-licensed. This project is not "
-            "affiliated with or endorsed by the data providers.\n",
+            "topo2stl https://github.com/PeteBoucher/topo2stl (the software) "
+            "is MIT-licensed. This project is not affiliated with or endorsed "
+            "by the data providers.\n",
             encoding="utf-8")
         print(f"Wrote {notice}")
 
