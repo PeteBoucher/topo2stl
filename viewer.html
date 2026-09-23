@@ -98,6 +98,7 @@
   <button id="bwire">Wireframe</button>
   <button id="bspin">Spin</button>
   <button id="bcoords">Coords</button>
+  <button id="bseams">Seams</button>
   <button id="barea">Area</button>
 </div>
 <div id="err"></div>
@@ -383,9 +384,38 @@ function applyMeta(m) {
     $('barea').disabled = false;
     pend = meta.bbox.slice();
   }
+  rebuildSeams(m);
   updateReliefRange();
   if (typeof refreshArea === 'function') refreshArea();
 }
+
+// --- tileset seam lines (from tileset_preview.py's sidecar) ------------------
+let showSeams = true;
+let seamLines = [];
+const seamMat = new THREE.LineBasicMaterial({ color: 0xff3b30 });
+
+function rebuildSeams(m) {
+  for (const line of seamLines) { scene.remove(line); line.geometry.dispose(); }
+  seamLines = [];
+  const segs = [...(m?.seams?.vertical || []), ...(m?.seams?.horizontal || [])];
+  for (const pts of segs) {
+    const g = new THREE.BufferGeometry().setFromPoints(
+      pts.map(p => new THREE.Vector3(p[0], p[1], p[2])));
+    const line = new THREE.Line(g, seamMat);
+    line.visible = showSeams;
+    scene.add(line);
+    seamLines.push(line);
+  }
+  const btn = $('bseams');
+  btn.disabled = segs.length === 0;
+  btn.classList.toggle('on', showSeams && segs.length > 0);
+}
+
+$('bseams').onclick = e => {
+  showSeams = !showSeams;
+  for (const line of seamLines) line.visible = showSeams;
+  e.target.classList.toggle('on', showSeams);
+};
 
 function placeCorner(el, world) {
   if (!showCoords || !meta || !world) { el.style.display = 'none'; return; }

@@ -48,7 +48,9 @@ Loose list of things to do, roughly in priority order.
   `.tileset.json` manifest and a small row-col ID engraved low on each tile's
   south wall. `tileset_preview.py` merges the tiles into one non-manifold
   preview STL at their assembled positions so `viewer.py` can show the whole
-  map (`python tileset_preview.py NAME.tileset.json --view`). Next:
+  map (`python tileset_preview.py NAME.tileset.json --view`), with a
+  toggleable red "Seams" overlay tracing each cut along the real terrain
+  edge (viewer.html's `rebuildSeams`). Next:
   - fold that into `viewer.py` directly (open a `.tileset.json` as the
     target, assemble in memory - no `.preview.stl` written to disk, and
     Regenerate could re-run the whole `--tile` command).

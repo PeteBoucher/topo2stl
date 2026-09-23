@@ -275,11 +275,15 @@ python tileset_preview.py granada.tileset.json --view
 ```
 
 This places each tile STL at its assembled position and opens the result in
-the usual viewer. It's for looking only — pegs/sockets aren't booleaned
-across tiles here (the tiles are just placed side by side), so don't slice
-`granada.preview.stl` for printing; print the individual tile files. Add
-`--gap 2` to open up a couple of mm between tiles in the preview if you want
-the seams easier to pick out.
+the usual viewer, with a red **Seams** overlay toggled on by default — one
+line per seam, traced along the actual terrain edge (not just a flat
+reference line) so you can see exactly where each cut falls and whether the
+relief lines up across it. It's for looking only — pegs/sockets aren't
+booleaned across tiles here (the tiles are just placed side by side), so
+don't slice `granada.preview.stl` for printing; print the individual tile
+files. Add `--gap 2` to open up a couple of mm between tiles in the preview
+if you'd rather see daylight between them (seam lines are skipped in that
+mode - the gap already shows where the cuts are).
 
 ---
 

@@ -18,7 +18,7 @@ rather than trusting the stale number.
 | [topo2stl.py](topo2stl.py) | ~1911 | Everything: CLI, download, cache, mesh build, buildings, emboss, tiling, STL write. Single file by design — see "Why one file" below. |
 | [viewer.py](viewer.py) | ~283 | stdlib-only HTTP server: serves `viewer.html`, the STL, the `.topo.json` sidecar, and a `/regen` endpoint that shells out to `topo2stl.py`. |
 | [viewer.html](viewer.html) | ~660 | The viewer's page: three.js render loop, HUD, Area pan/zoom panel, regen/save-as UI. All JS is inline in this one file. |
-| [tileset_preview.py](tileset_preview.py) | ~85 | Standalone script: merges a `--tile` run's tiles back into one non-manifold preview STL (positioned as assembled, not booleaned) so `viewer.py` can show the whole map. Imports `write_binary_stl`/`launch_viewer` from `topo2stl.py`. |
+| [tileset_preview.py](tileset_preview.py) | ~130 | Standalone script: merges a `--tile` run's tiles back into one non-manifold preview STL (positioned as assembled, not booleaned) so `viewer.py` can show the whole map, plus a `.topo.json` sidecar with a seam polyline per internal wall (`_wall_profile`, traced from the tile mesh's own top-edge vertices - not synthesized) that `viewer.html`'s Seams overlay draws. Imports `write_binary_stl`/`launch_viewer` from `topo2stl.py`. |
 | [docs/buildings-scope.md](docs/buildings-scope.md) | — | Design notes for the buildings feature (why OSM vs raster, etc). Background reading, not code. |
 | [BACKLOG.md](BACKLOG.md) | — | Known issues + unimplemented ideas. Check before "fixing" something that's a known, accepted limitation (e.g. sharp-peak stringing). |
 | `cache/` | — | Downloaded elevation/building/vegetation grids as `.npy`, keyed by a hash of request params. Gitignored. Safe to delete; everything re-downloads. |
@@ -154,7 +154,8 @@ row: Fit/Relief/Wireframe/Spin/Coords/Area), `#area` (pan/zoom panel),
 | `frame` / `setModel` | 259, 273 | Fit camera to geometry / swap in a newly loaded STL, keeping camera unless `refit`. |
 | `poll` | 315 | Polls `/version` on an interval; reloads the mesh on change (this is how `--view` auto-refresh works). |
 | `resize` | 353 | Canvas/renderer resize on window resize. |
-| `applyMeta` / `placeCorner` / `placeCorners` | 370, 390, 405 | Read `.topo.json` sidecar → position the SW/NE lat/lon HUD labels in screen space. |
+| `applyMeta` / `placeCorner` / `placeCorners` | 370, 390, 405 | Read `.topo.json` sidecar → position the SW/NE lat/lon HUD labels in screen space; also calls `rebuildSeams`. |
+| `rebuildSeams` | ~394 | Draws `meta.seams.{vertical,horizontal}` (written by `tileset_preview.py`) as red `THREE.Line`s in the scene - the "Seams" button toggle. |
 | `refreshArea` | 428 | Redraw the blue pan/zoom rectangle for the Area panel from the pending bbox. |
 | `panPend` / `zoomPend` | 452, 458 | Mutate the pending bbox (Shift = fine, Alt = coarse step, per README). |
 | `checkRegenAvail` | 487 | Calls `/regen/available`, enables/disables Regenerate + Save-as. |
