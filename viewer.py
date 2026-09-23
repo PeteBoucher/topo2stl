@@ -27,6 +27,7 @@ from urllib.parse import parse_qs, urlparse
 
 PORT = 8731
 TOPO2STL = Path(__file__).with_name("topo2stl.py")
+TILESET_PREVIEW = Path(__file__).with_name("tileset_preview.py")
 
 # area / output options stripped from the stored argv before re-running with a
 # fresh --bbox (name -> whether it takes a following value)
@@ -67,6 +68,31 @@ def _target_from_name(name: str) -> Path:
     return Handler.stl_path.parent / name
 
 
+def _is_tiled(meta: dict) -> bool:
+    """Whether the sidecar's original command used --tile - both a bare
+    tile's own sidecar and a tileset_preview.py merge's carry the full
+    original argv, so this works from either."""
+    return any(tok.split("=", 1)[0] == "--tile" for tok in meta.get("argv", []))
+
+
+def _exists_for_save(name: str) -> bool:
+    """Whether "save as `name`" would overwrite something. A plain model
+    writes to that file directly; a --tile model never writes to its own
+    -o path at all (write_tiles only writes NAME_r#c#.stl + NAME.tileset.json),
+    so the meaningful check there is the manifest that would land there."""
+    try:
+        target = _target_from_name(name)
+    except ValueError:
+        return False
+    try:
+        tiled = _is_tiled(json.loads(_sidecar(Handler.stl_path).read_text()))
+    except Exception:
+        tiled = False
+    if tiled:
+        return target.with_name(target.stem + ".tileset.json").exists()
+    return target.exists()
+
+
 def _regen_available():
     if not TOPO2STL.exists():
         return False, "topo2stl.py is not next to viewer.py"
@@ -76,6 +102,15 @@ def _regen_available():
         return False, "no .topo.json sidecar for this model"
     if not isinstance(meta.get("argv"), list):
         return False, "sidecar predates regen - rebuild once from the CLI"
+    if _is_tiled(meta):
+        if meta.get("generator") != "tileset_preview":
+            return False, ("this is one tile of a --tile set - open the merged "
+                           "preview to regenerate the whole area "
+                           "(tileset_preview.py NAME.tileset.json --view)")
+        if not meta.get("tileset_output"):
+            return False, "this preview predates tiled regen - rebuild it with tileset_preview.py"
+        if not TILESET_PREVIEW.exists():
+            return False, "tileset_preview.py is not next to viewer.py"
     if not _have_numpy():
         return False, "this Python has no numpy - start viewer.py with the venv Python"
     return True, ""
@@ -110,29 +145,56 @@ def _area_args(argv, bbox):
     return ["--bbox", ",".join(f"{v:.6f}" for v in bbox)]
 
 
+def _run_subprocess(cmd: list[str]) -> int:
+    with _regen_lock:
+        _regen["log"] += "$ " + " ".join(cmd) + "\n\n"
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1, cwd=str(TOPO2STL.parent))
+    for line in proc.stdout:
+        with _regen_lock:
+            _regen["log"] += line
+    return proc.wait()
+
+
 def _run_regen(bbox, target: Path | None = None):
     """Re-run topo2stl for `bbox`. Overwrites the current model by default;
     if `target` is given (a "save as"), writes there instead and, on
-    success, retargets the viewer to the new file."""
+    success, retargets the viewer to the new file.
+
+    For a --tile model, `target` (or the sidecar's remembered
+    `tileset_output`) is the tileset's *base* name - write_tiles never
+    writes a file there itself, only NAME_r#c#.stl + NAME.tileset.json - so
+    after that succeeds this also re-runs tileset_preview.py and retargets
+    the viewer to the fresh merged preview, not the base name."""
     stl = Handler.stl_path
-    out_path = target or stl
     try:
         meta = json.loads(_sidecar(stl).read_text())
         argv = meta["argv"]
+        tiled = _is_tiled(meta)
+        if tiled:
+            out_path = target or Path(meta["tileset_output"])
+            if not out_path.is_absolute():
+                out_path = stl.parent / out_path
+        else:
+            out_path = target or stl
+
         cmd = [sys.executable, str(TOPO2STL), *_area_args(argv, bbox),
                *_strip_area_args(argv), "-o", str(out_path)]
         with _regen_lock:
-            _regen["log"] = "$ " + " ".join(cmd) + "\n\n"
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, bufsize=1,
-                                cwd=str(TOPO2STL.parent))
-        for line in proc.stdout:
-            with _regen_lock:
-                _regen["log"] += line
-        rc = proc.wait()
+            _regen["log"] = ""
+        rc = _run_subprocess(cmd)
         err = None if rc == 0 else f"topo2stl exited with code {rc}"
-        if err is None and target is not None:
-            Handler.stl_path = target
+
+        new_target = target if (err is None and target is not None) else None
+        if err is None and tiled:
+            manifest = out_path.with_name(out_path.stem + ".tileset.json")
+            preview = out_path.with_name(out_path.stem + ".preview.stl")
+            rc2 = _run_subprocess([sys.executable, str(TILESET_PREVIEW),
+                                  str(manifest), "-o", str(preview)])
+            err = None if rc2 == 0 else f"tileset_preview.py exited with code {rc2}"
+            new_target = preview if err is None else new_target
+        if err is None and new_target is not None:
+            Handler.stl_path = new_target
     except Exception as e:                    # noqa: BLE001
         err = f"{type(e).__name__}: {e}"
     with _regen_lock:
@@ -195,10 +257,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif p == "/exists":
                 qs = parse_qs(urlparse(self.path).query)
                 name = (qs.get("name") or [""])[0]
-                try:
-                    exists = _target_from_name(name).exists() if name else False
-                except ValueError:
-                    exists = False
+                exists = _exists_for_save(name) if name else False
                 self._send(json.dumps({"exists": exists}).encode(),
                            "application/json")
             else:

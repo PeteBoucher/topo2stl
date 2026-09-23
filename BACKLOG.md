@@ -50,10 +50,13 @@ Loose list of things to do, roughly in priority order.
   preview STL at their assembled positions so `viewer.py` can show the whole
   map (`python tileset_preview.py NAME.tileset.json --view`), with a
   toggleable red "Seams" overlay tracing each cut along the real terrain
-  edge (viewer.html's `rebuildSeams`). Next:
-  - fold that into `viewer.py` directly (open a `.tileset.json` as the
-    target, assemble in memory - no `.preview.stl` written to disk, and
-    Regenerate could re-run the whole `--tile` command).
+  edge (viewer.html's `rebuildSeams`). Regenerate/Save-as work from that
+  merged preview too - pan/zoom/save reruns the whole `--tile` command then
+  re-merges automatically and switches the viewer to the fresh preview;
+  opening a bare tile file disables Regenerate with a pointer to the merged
+  preview instead. Next:
+  - fold the merge into `viewer.py` directly (open a `.tileset.json` as the
+    target, assemble in memory - no `.preview.stl` written to disk).
   - drop the "one bare peg centred" fallback for a very short seam in favour
     of a slightly larger minimum tile size check.
   - a building footprint straddling a seam is clipped independently by each

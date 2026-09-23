@@ -121,20 +121,20 @@ If the flag should survive a viewer-triggered regenerate with a *new area*
 (viewer.py:33) — only area/output flags are stripped and replaced; everything
 else round-trips via the stored `argv` untouched.
 
-## viewer.py — endpoint map (Handler class, viewer.py:156-249)
+## viewer.py — endpoint map (Handler class, viewer.py)
 
 | Method | Path | Does |
 | --- | --- | --- |
-| GET | `/` | Serves `viewer.html` (viewer.py:145-151, reads the file fresh each time). |
+| GET | `/` | Serves `viewer.html` (reads the file fresh each time). |
 | GET | `/name` | Current STL filename. |
-| GET | `/version` | `"<mtime_ns>\|<name>"` — polled by the page to detect file changes/switches. |
+| GET | `/version` | `"<mtime_ns>\|<name>"` — polled by the page to detect file changes/switches (including a regen retarget - see `poll()` in viewer.html). |
 | GET | `/model.stl` | The STL bytes. |
-| GET | `/meta` | The `.topo.json` sidecar (bbox, m_per_mm, etc), or `{}`. |
-| GET | `/regen/available` | Whether Regenerate/Save-as can run (needs `topo2stl.py` beside `viewer.py`, a sidecar with `argv`, and numpy) — `_regen_available()`, viewer.py:70. |
+| GET | `/meta` | The `.topo.json` sidecar (bbox, m_per_mm, tile_grid/seams for a tileset preview, etc), or `{}`. |
+| GET | `/regen/available` | Whether Regenerate/Save-as can run — `_regen_available()`, viewer.py:96. Needs `topo2stl.py` beside `viewer.py`, a sidecar with `argv`, and numpy; for a `--tile` sidecar (`_is_tiled()`, viewer.py:71) it also requires the CURRENT view to be a `tileset_preview.py` merge (not a bare `_r#c#.stl` tile) with a `tileset_output` field, and `tileset_preview.py` beside `viewer.py`. |
 | GET | `/regen/status` | Poll target for an in-flight regen: `running/done/error/log/saved_as`. |
-| GET | `/exists?name=` | Whether a "Save as" filename already exists (for the confirm-overwrite prompt). |
-| POST | `/target` | Retarget the running server at a different STL path (used by `launch_viewer()`'s "already running" path and by a successful Save-as). |
-| POST | `/regen` | Body `{bbox, filename?}`. No `filename` = overwrite current file; with `filename` = "Save as" a new one (`_target_from_name`, viewer.py:59). Rebuilds the argv via `_area_args`/`_strip_area_args` (viewer.py:84-110) and runs `topo2stl.py` in a background thread (`_run_regen`, viewer.py:113). |
+| GET | `/exists?name=` | Whether a "Save as" filename already exists - `_exists_for_save()` (viewer.py:78) checks the literal file for a plain model, or `<name-stem>.tileset.json` for a tiled one (write_tiles never writes a file at the bare `-o` path itself). |
+| POST | `/target` | Retarget the running server at a different STL path (used by `launch_viewer()`'s "already running" path and by a successful Save-as/tiled-regen). |
+| POST | `/regen` | Body `{bbox, filename?}`. No `filename` = overwrite current model/tileset; with `filename` = "Save as" a new one (`_target_from_name`, viewer.py:60). Rebuilds the argv via `_area_args`/`_strip_area_args` (tile flags like `--tile`/`--bed-size` aren't area/output flags, so they pass through untouched) and runs the pipeline in a background thread (`_run_regen`, viewer.py:159). For a tiled sidecar this is two subprocesses in sequence - `topo2stl.py ... --tile ...` then `tileset_preview.py <manifest> -o <preview>` - and `Handler.stl_path` ends up pointed at the fresh `.preview.stl`, never at the tileset's nominal `-o` base name (nothing is ever written there). |
 
 Global mutable state: `Handler.stl_path` (class attribute, the file currently
 served) and `_regen` dict (module-level, regen progress) guarded by
@@ -158,8 +158,8 @@ row: Fit/Relief/Wireframe/Spin/Coords/Area), `#area` (pan/zoom panel),
 | `rebuildSeams` | ~394 | Draws `meta.seams.{vertical,horizontal}` (written by `tileset_preview.py`) as red `THREE.Line`s in the scene - the "Seams" button toggle. |
 | `refreshArea` | 428 | Redraw the blue pan/zoom rectangle for the Area panel from the pending bbox. |
 | `panPend` / `zoomPend` | 452, 458 | Mutate the pending bbox (Shift = fine, Alt = coarse step, per README). |
-| `checkRegenAvail` | 487 | Calls `/regen/available`, enables/disables Regenerate + Save-as. |
-| `startRegen` | 509 | POSTs `/regen` with `{bbox, filename?}` — shared by Regenerate and Save-as buttons, `filename` present only for Save-as. |
+| `checkRegenAvail` | 487 | Calls `/regen/available`, enables/disables Regenerate + Save-as; the disabled reason (e.g. "open the merged preview...") lands in `#areahint` verbatim. |
+| `startRegen` | ~539 | POSTs `/regen` with `{bbox, filename?}` — shared by Regenerate and Save-as buttons, `filename` present only for Save-as. `applyMeta` relabels the button/placeholder/modal title to mention "tileset" when `meta.tile_grid` is set (`tiledNow()`). |
 | `regenFail` | 524 | Show an error in the regen modal. |
 | `pollRegen` | 529 | Polls `/regen/status` while a regen runs, streams `log` into `#regenlog`. |
 | `updateCompass` / `tick` | 547, 555 | North-needle rotation from camera azimuth; main render-loop tick. |
@@ -177,7 +177,8 @@ row: Fit/Relief/Wireframe/Spin/Coords/Area), `#area` (pan/zoom panel),
 | Change the sidecar `.topo.json` schema | `meta = {...}` dict in `main()` — remember `viewer.py` reads `meta["argv"]` and `meta["bbox"]` specifically; `write_tiles()` builds its own (smaller) per-tile `meta` dict, keep the two in sync |
 | Change the peg/socket seam keying (size, spacing, which walls carry pegs) | `_tile_seam_geoms`, topo2stl.py:863 — the convention ("pegs on south/east, sockets on north/west") is asserted in that function's neighbour checks, not documented elsewhere in code |
 | Change tile splitting / bed-size check | `_split_range` + the bed check loop in `write_tiles`, topo2stl.py:809, 944 |
-| Change viewer Regenerate/Save-as behaviour | `_run_regen`/`_area_args`/`_strip_area_args`, viewer.py:84-141, and `startRegen`/`pollRegen` in viewer.html:509-546 |
+| Change viewer Regenerate/Save-as behaviour | `_run_regen`/`_area_args`/`_strip_area_args`, viewer.py:119-205, and `startRegen`/`pollRegen` in viewer.html (~539-577) |
+| Change tiled-regen behaviour specifically (the topo2stl.py → tileset_preview.py handoff) | `_is_tiled`/`_regen_available`/`_run_regen` in viewer.py:71, 96, 159 |
 | Change the Area pan/zoom panel UI | viewer.html `#area` block (~104-119) + `refreshArea`/`panPend`/`zoomPend` (viewer.html:428-486) |
 | Known accepted limitations (don't "fix" without asking) | [BACKLOG.md](BACKLOG.md) "Known issues" — sharp-peak stringing, minor non-manifold edges on flat-roof unions, a building footprint straddling a tile seam is clipped independently by each tile |
 
@@ -209,3 +210,13 @@ row: Fit/Relief/Wireframe/Spin/Coords/Area), `#area` (pan/zoom panel),
   subprocess with a reconstructed argv — it does not call any Python
   function directly. Changing `main()`'s argument parsing can silently break
   the viewer's regen path.
+- **A tileset's sidecar identity is split across two files.** A bare tile's
+  own `NAME_r#c#.topo.json` carries the real `argv`/`base_mm` but only that
+  tile's own tiny bbox; the merged preview's sidecar (written by
+  `tileset_preview.py`, not `write_tiles`) copies `argv` across and adds
+  `tileset_output`/`tile_grid` alongside the *assembled* bbox. Viewer regen
+  only works from the merged-preview sidecar (`_regen_available` refuses a
+  bare tile view by design - resplitting one tile's own bbox into another
+  grid isn't meaningful) — if you add a field one of these needs for a new
+  feature, check whether it belongs in `write_tiles`' per-tile `meta`,
+  `tileset_preview.py`'s merged `meta`, or both.

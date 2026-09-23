@@ -85,6 +85,14 @@ def main(argv=None):
     tiles = manifest["tiles"]
     trows, tcols = manifest["tile_grid"]
 
+    # any tile's own sidecar carries the full original topo2stl argv (they're
+    # all identical) and base_mm (shared across the whole tileset) - grab
+    # both once so the merged preview can support regen too.
+    first_stl = manifest_path.with_name(tiles[0]["file"])
+    first_sidecar = first_stl.with_name(first_stl.stem + ".topo.json")
+    tile_meta = json.loads(first_sidecar.read_text()) if first_sidecar.exists() else {}
+    base_mm = tile_meta.get("base_mm", 0.0)
+
     by_rc = {(t["row"], t["col"]): t for t in tiles}
     col_w = [by_rc[(1, c)]["width_mm"] for c in range(1, tcols + 1)]
     row_h = [by_rc[(r, 1)]["height_mm"] for r in range(1, trows + 1)]
@@ -110,8 +118,6 @@ def main(argv=None):
         # exactly the walls write_tiles put pegs on, one line per seam.
         if a.gap == 0.0:
             verts = v.reshape(-1, 3)
-            sidecar = stl_path.with_name(stl_path.stem + ".topo.json")
-            base_mm = json.loads(sidecar.read_text())["base_mm"] if sidecar.exists() else 0.0
             if c < tcols:
                 v_seams.append(_wall_profile(verts, 0, xo + t["width_mm"], base_mm))
             if r < trows:
@@ -129,7 +135,13 @@ def main(argv=None):
     sidecar_out = out.with_name(out.stem + ".topo.json")
     meta = {"bbox": manifest.get("bbox"), "generator": "tileset_preview",
            "seams": {"vertical": [s for s in v_seams if s],
-                     "horizontal": [s for s in h_seams if s]}}
+                     "horizontal": [s for s in h_seams if s]},
+           # carried through from a tile's own sidecar so viewer.py's
+           # Regenerate/Save-as can re-run the whole --tile command from
+           # this merged view (see _run_regen in viewer.py).
+           "argv": tile_meta.get("argv"),
+           "tileset_output": base + ".stl",
+           "tile_grid": manifest.get("tile_grid")}
     sidecar_out.write_text(json.dumps(meta), encoding="utf-8")
     n_seams = len(meta["seams"]["vertical"]) + len(meta["seams"]["horizontal"])
     print(f"Wrote {sidecar_out} ({n_seams} seam lines" +

@@ -132,6 +132,16 @@ Each `topo2stl.py` run writes a small `<name>.topo.json` sidecar next to the STL
 (bounding box, settings, and the command line, for the viewer's Regenerate).
 It's harmless to delete; slicers ignore it.
 
+Regenerate/Save-as also work on a tileset's merged preview (open it with
+`tileset_preview.py NAME.tileset.json --view`, not one of the individual
+`_r#c#.stl` tiles) — the button relabels to **Regenerate NxM tileset**, and
+panning/zooming/saving re-runs the whole `--tile` command (rewriting every
+tile) followed by `tileset_preview.py` automatically, then switches the
+viewer to the fresh merged preview. Opening one bare tile file directly
+disables Regenerate with a note pointing you at the merged preview instead,
+since panning that tile's own tiny bbox and re-splitting it into more tiles
+isn't a sensible operation.
+
 > The viewer loads three.js from a CDN, so it needs an internet connection the
 > first time a browser caches it.
 

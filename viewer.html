@@ -385,6 +385,9 @@ function applyMeta(m) {
     pend = meta.bbox.slice();
   }
   rebuildSeams(m);
+  const tiled = !!(meta && meta.tile_grid);
+  $('bregen').textContent = tiled ? `Regenerate ${meta.tile_grid[0]}x${meta.tile_grid[1]} tileset` : 'Regenerate STL';
+  $('saveasname').placeholder = tiled ? 'save as new tileset base name…' : 'save as new file…';
   updateReliefRange();
   if (typeof refreshArea === 'function') refreshArea();
 }
@@ -523,7 +526,9 @@ async function checkRegenAvail() {
   } catch (_) { $('bregen').disabled = true; $('bsaveas').disabled = true; }
 }
 
-$('bregen').onclick = () => startRegen('Regenerating…');
+const tiledNow = () => !!(meta && meta.tile_grid);
+
+$('bregen').onclick = () => startRegen(tiledNow() ? 'Regenerating tileset…' : 'Regenerating…');
 
 $('bsaveas').onclick = async () => {
   let name = $('saveasname').value.trim();
@@ -531,9 +536,10 @@ $('bsaveas').onclick = async () => {
   if (!/\.stl$/i.test(name)) name += '.stl';
   try {
     const ex = await (await fetch('/exists?name=' + encodeURIComponent(name))).json();
-    if (ex.exists && !confirm(`${name} already exists - overwrite it?`)) return;
+    const what = tiledNow() ? `a ${name.replace(/\.stl$/i, '')} tileset` : name;
+    if (ex.exists && !confirm(`${what} already exists - overwrite it?`)) return;
   } catch (_) { /* can't check - proceed, the server still confirms bbox validity */ }
-  startRegen(`Saving as ${name}…`, name);
+  startRegen(tiledNow() ? `Saving as ${name} tileset…` : `Saving as ${name}…`, name);
 };
 
 async function startRegen(title, filename) {
