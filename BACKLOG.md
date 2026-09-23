@@ -30,17 +30,22 @@ Loose list of things to do, roughly in priority order.
 - **viewer Area picker follow-ups** — done: pan/zoom bbox + Regenerate in the
   viewer; **Save as** to build the pending area to a new named file instead of
   overwriting the current one. Next: drag the blue rect directly; a 2D map
-  thumbnail; remember panel state (pend/camera) across a page reload;
-  `--replace` so the CLI `--view` re-runs don't orphan servers.
-- **viewer.py lifecycle** — `--view` starts the server detached
-  (`start_new_session=True`) so it outlives the shell and a later
-  `viewer.py X.stl` just hits "port busy". Add:
-  - `/quit` POST endpoint → server calls `srv.shutdown()` on itself.
-  - `viewer.py --kill` — POST `/quit`, exit; "nothing running" if free.
-  - `viewer.py X.stl --replace` — kill any running viewer, then start fresh
-    on X.stl; make `topo2stl --view` use this so re-runs always land on the
-    right file.
-  - maybe `viewer.py --status` — print the running viewer's current STL.
+  thumbnail; remember panel state (pend/camera) across a page reload.
+- **viewer.py lifecycle** — done: `/quit` POST endpoint (`srv.shutdown()` from
+  a fresh thread, since calling it from the handler thread that received the
+  request would otherwise race the response); `viewer.py --kill` (POST
+  `/quit`, "nothing running" if the port's free); `viewer.py X.stl --replace`
+  (kill whatever's running first, then start fresh); `/status` (pid/started
+  timestamp/current stl - backs `--kill`/`--replace` and a manual check).
+  `launch_viewer()` (used by both `topo2stl.py --view` and
+  `tileset_preview.py --view`) now also compares a running server's `started`
+  time against viewer.py/topo2stl.py/tileset_preview.py's on-disk mtimes and
+  auto-replaces (rather than just retargets) a server that predates the
+  current code - otherwise a viewer left running from before a code change
+  just keeps serving its old behaviour forever, which looks exactly like
+  it's ignoring new input (this is what caused "regenerated tileset always
+  the same, ignores the new area box" - a stale pre-tiling-support viewer.py
+  was still bound to the port).
 - **Multi-tile printing** — done: `--tile ROWSxCOLS` splits a model too big
   for one bed into a grid of tiles cut from one continuous elevation field,
   keyed with peg/socket seams molded into the base (`--bed-size`,

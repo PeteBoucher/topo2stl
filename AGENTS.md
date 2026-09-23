@@ -133,8 +133,10 @@ else round-trips via the stored `argv` untouched.
 | GET | `/regen/available` | Whether Regenerate/Save-as can run — `_regen_available()`, viewer.py:96. Needs `topo2stl.py` beside `viewer.py`, a sidecar with `argv`, and numpy; for a `--tile` sidecar (`_is_tiled()`, viewer.py:71) it also requires the CURRENT view to be a `tileset_preview.py` merge (not a bare `_r#c#.stl` tile) with a `tileset_output` field, and `tileset_preview.py` beside `viewer.py`. |
 | GET | `/regen/status` | Poll target for an in-flight regen: `running/done/error/log/saved_as`. |
 | GET | `/exists?name=` | Whether a "Save as" filename already exists - `_exists_for_save()` (viewer.py:78) checks the literal file for a plain model, or `<name-stem>.tileset.json` for a tiled one (write_tiles never writes a file at the bare `-o` path itself). |
-| POST | `/target` | Retarget the running server at a different STL path (used by `launch_viewer()`'s "already running" path and by a successful Save-as/tiled-regen). |
+| GET | `/status` | `{pid, started, stl}` - `started` is this process's start time (module-level `STARTED_AT`), used by `launch_viewer()` to tell a stale server (predates the current code) from a fresh one, and by `--kill`/`--status`-style checks. |
+| POST | `/target` | Retarget the running server at a different STL path (used by `launch_viewer()`'s "already running, not stale" path and by a successful Save-as/tiled-regen). |
 | POST | `/regen` | Body `{bbox, filename?}`. No `filename` = overwrite current model/tileset; with `filename` = "Save as" a new one (`_target_from_name`, viewer.py:60). Rebuilds the argv via `_area_args`/`_strip_area_args` (tile flags like `--tile`/`--bed-size` aren't area/output flags, so they pass through untouched) and runs the pipeline in a background thread (`_run_regen`, viewer.py:159). For a tiled sidecar this is two subprocesses in sequence - `topo2stl.py ... --tile ...` then `tileset_preview.py <manifest> -o <preview>` - and `Handler.stl_path` ends up pointed at the fresh `.preview.stl`, never at the tileset's nominal `-o` base name (nothing is ever written there). |
+| POST | `/quit` | Responds, then shuts the server down from a fresh thread (`Handler.server_ref.shutdown()` - must not run on the request-handling thread, see the comment at the call site). Backs `viewer.py --kill`/`--replace` and `launch_viewer()`'s stale-server restart. |
 
 Global mutable state: `Handler.stl_path` (class attribute, the file currently
 served) and `_regen` dict (module-level, regen progress) guarded by
@@ -210,6 +212,15 @@ row: Fit/Relief/Wireframe/Spin/Coords/Area), `#area` (pan/zoom panel),
   subprocess with a reconstructed argv — it does not call any Python
   function directly. Changing `main()`'s argument parsing can silently break
   the viewer's regen path.
+- **"the viewer seems to ignore everything I change" is almost always a
+  stale server**, not a logic bug — a `viewer.py` left running from before
+  the code changed keeps running the old code forever, because a later
+  `viewer.py`/`--view` call just retargets it rather than restarting it (fast
+  path for the common "just re-ran topo2stl.py" case). Check `curl
+  localhost:8731/status` and compare `started` against `viewer.py`'s mtime
+  before chasing a phantom bug; `launch_viewer()` auto-restarts a server it
+  detects as stale, but that only runs on the *next* `--view` call, not on
+  polling an existing page. `viewer.py --replace` fixes it immediately.
 - **A tileset's sidecar identity is split across two files.** A bare tile's
   own `NAME_r#c#.topo.json` carries the real `argv`/`base_mm` but only that
   tile's own tiny bbox; the merged preview's sidecar (written by

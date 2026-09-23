@@ -116,6 +116,15 @@ a **Relief** toggle (hypsometric tint + elevation contour lines at a real-metre
 interval). It polls the STL file and reloads the mesh on change, keeping your
 camera.
 
+A later `viewer.py` call retargets an already-running server on the same port
+rather than starting a new one - fast, but it means a server left running
+from *before* a `topo2stl.py`/`viewer.py` update keeps serving with the old
+code indefinitely (`--view` and `tileset_preview.py --view` now detect this
+automatically and restart it for you). If a viewer ever seems to be ignoring
+what you change, `python viewer.py --kill` stops whatever's on the port
+(add `--port N` if you're not using the default 8731); `python viewer.py
+X.stl --replace` stops it and starts fresh on `X.stl` in one step.
+
 **Area** opens a panel to pan / zoom the bounding box (a blue rectangle shows
 the new extent over the model) and **Regenerate STL** — the viewer re-runs
 `topo2stl.py` with the new `--bbox` and all the same other settings, streams the

@@ -1878,30 +1878,62 @@ def main(argv=None):
 
 
 def launch_viewer(stl_path: Path, port: int = 8731):
-    """Start viewer.py, or retarget an already-running one at `port`."""
+    """Start viewer.py, or retarget an already-running one at `port` -
+    unless that server predates the current viewer.py/topo2stl.py code (e.g.
+    left running from before a --tile/regen update), in which case it's
+    restarted instead of retargeted: an old server would otherwise just keep
+    running its old behaviour forever, which looks exactly like it's
+    ignoring whatever changed."""
     import socket
     import subprocess
+    import urllib.request
     stl_path = stl_path.resolve()
-    with socket.socket() as s:
-        s.settimeout(0.3)
-        already_running = s.connect_ex(("127.0.0.1", port)) == 0
-    if already_running:
-        try:
-            import urllib.request
-            urllib.request.urlopen(
-                urllib.request.Request(f"http://127.0.0.1:{port}/target",
-                                       data=str(stl_path).encode()),
-                timeout=2).read()
-            print(f"viewer at http://localhost:{port}/ now showing {stl_path.name}")
-        except Exception:
-            print(f"viewer already live at http://localhost:{port}/ "
-                  f"(couldn't retarget it; restart it on {stl_path.name})")
-        return
     viewer = Path(__file__).parent / "viewer.py"
+
+    def alive() -> bool:
+        with socket.socket() as s:
+            s.settimeout(0.3)
+            return s.connect_ex(("127.0.0.1", port)) == 0
+
+    if alive():
+        code_files = (viewer, Path(__file__),
+                      Path(__file__).with_name("tileset_preview.py"))
+        code_mtime = max((p.stat().st_mtime for p in code_files if p.exists()),
+                         default=0.0)
+        stale = False
+        try:
+            status = json.loads(urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/status", timeout=2).read())
+            stale = status.get("started", float("inf")) < code_mtime
+        except Exception:
+            pass                       # can't tell - assume it's fine, retarget
+        if not stale:
+            try:
+                urllib.request.urlopen(
+                    urllib.request.Request(f"http://127.0.0.1:{port}/target",
+                                           data=str(stl_path).encode()),
+                    timeout=2).read()
+                print(f"viewer at http://localhost:{port}/ now showing {stl_path.name}")
+            except Exception:
+                print(f"viewer already live at http://localhost:{port}/ "
+                      f"(couldn't retarget it; restart it on {stl_path.name})")
+            return
+        print(f"viewer on port {port} predates the current code - restarting it")
+        try:
+            urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{port}/quit", data=b"", method="POST"),
+                timeout=2).read()
+        except Exception:
+            pass
+        for _ in range(20):            # wait up to ~2s for the port to free
+            if not alive():
+                break
+            time.sleep(0.1)
+
     if not viewer.exists():
         print("viewer.py not found; skipping --view")
         return
-    subprocess.Popen([sys.executable, str(viewer), str(stl_path)],
+    subprocess.Popen([sys.executable, str(viewer), str(stl_path), "--port", str(port)],
                      start_new_session=True)
     print(f"viewer starting at http://localhost:{port}/  "
           f"(leave it open; future runs auto-reload {stl_path.name})")

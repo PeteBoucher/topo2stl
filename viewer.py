@@ -9,6 +9,13 @@ re-run topo2stl.py and overwrite that file, the view reloads automatically
 (camera is kept), so you can dial in --z-exaggeration / --model-width / --base
 without touching the slicer.
 
+A later `viewer.py other.stl` just retargets an already-running server on the
+same port rather than restarting it - fine for a new model, but it means a
+server started before a viewer.py/topo2stl.py code change keeps running the
+old code. `--replace` kills any running viewer first and starts fresh (this
+is what a stale server serving the same content forever, ignoring apparently
+irrelevant input, usually means); `--kill` just stops whatever's running.
+
 Standard library only - no pip install needed.
 """
 
@@ -21,6 +28,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -28,6 +36,10 @@ from urllib.parse import parse_qs, urlparse
 PORT = 8731
 TOPO2STL = Path(__file__).with_name("topo2stl.py")
 TILESET_PREVIEW = Path(__file__).with_name("tileset_preview.py")
+STARTED_AT = time.time()   # this process's start - lets a caller (launch_viewer,
+                           # --replace) tell whether an already-running viewer
+                           # predates the current code and needs restarting,
+                           # not just retargeting
 
 # area / output options stripped from the stored argv before re-running with a
 # fresh --bbox (name -> whether it takes a following value)
@@ -217,6 +229,7 @@ def _page() -> bytes:
 
 class Handler(http.server.BaseHTTPRequestHandler):
     stl_path: Path = Path()
+    server_ref: http.server.HTTPServer | None = None
 
     def _send(self, body: bytes, ctype: str, code: int = 200):
         self.send_response(code)
@@ -260,6 +273,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 exists = _exists_for_save(name) if name else False
                 self._send(json.dumps({"exists": exists}).encode(),
                            "application/json")
+            elif p == "/status":
+                # who's running here and since when - lets launch_viewer()
+                # tell a stale process (started before viewer.py/topo2stl.py
+                # last changed) apart from a fresh one, and backs `--status`.
+                self._send(json.dumps({"pid": os.getpid(), "started": STARTED_AT,
+                                       "stl": str(self.stl_path)}).encode(),
+                           "application/json")
             else:
                 self._send(b"not found", "text/plain", 404)
         except OSError:
@@ -300,6 +320,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                saved_as=None)
             threading.Thread(target=_run_regen, args=(bb, target), daemon=True).start()
             self._send(b'{"started":true}', "application/json")
+        elif p == "/quit":
+            self._send(b'{"stopping":true}', "application/json")
+            # shut down from a fresh thread - shutdown() blocks until
+            # serve_forever() (running on the main thread) notices and
+            # returns, which would deadlock if run on this handler thread
+            # instead, and would also prevent this response from flushing.
+            if Handler.server_ref is not None:
+                threading.Thread(target=Handler.server_ref.shutdown, daemon=True).start()
         else:
             self._send(b"not found", "text/plain", 404)
 
@@ -307,15 +335,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def _port_alive(port: int) -> bool:
+    with socket.socket() as s:
+        s.settimeout(0.3)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _quit_running(port: int) -> bool:
+    """POST /quit to whatever's listening on `port`. Returns whether anything
+    was there to ask (not whether it was actually a viewer.py - best effort,
+    same assumption launch_viewer() already makes elsewhere)."""
+    if not _port_alive(port):
+        return False
+    try:
+        import urllib.request
+        urllib.request.urlopen(
+            urllib.request.Request(f"http://127.0.0.1:{port}/quit", data=b"",
+                                   method="POST"), timeout=2).read()
+    except Exception:
+        pass
+    for _ in range(20):                # wait up to ~2s for the port to free
+        if not _port_alive(port):
+            break
+        time.sleep(0.1)
+    return True
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    if not argv:
-        sys.exit("usage: viewer.py OUTPUT.stl [--port N] [--no-open]")
-    Handler.stl_path = Path(argv[0]).resolve()
     port = PORT
-    no_open = "--no-open" in argv
     if "--port" in argv:
         port = int(argv[argv.index("--port") + 1])
+
+    if "--kill" in argv:
+        print(f"stopped the viewer on port {port}" if _quit_running(port)
+              else f"nothing running on port {port}")
+        return
+
+    if not argv or argv[0].startswith("--"):
+        sys.exit("usage: viewer.py OUTPUT.stl [--port N] [--no-open] [--replace]\n"
+                 "       viewer.py --kill [--port N]")
+    Handler.stl_path = Path(argv[0]).resolve()
+    no_open = "--no-open" in argv
+
+    if "--replace" in argv and _quit_running(port):
+        print(f"replaced the viewer previously on port {port}")
 
     url = f"http://localhost:{port}/"
     try:
@@ -323,10 +387,13 @@ def main(argv=None):
     except OSError:
         # a viewer is very likely already bound to this port; just point the
         # browser at it (it polls the file, so it will show the fresh model).
+        # If it's running code older than what's on disk now, --replace above
+        # would already have cleared it before this point.
         print(f"port {port} busy - assuming a viewer is already running: {url}")
         if not no_open:
             webbrowser.open(url)
         return
+    Handler.server_ref = srv
 
     print(f"serving {Handler.stl_path.name} at {url}  (Ctrl-C to stop)")
     if not no_open:
