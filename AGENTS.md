@@ -18,6 +18,7 @@ rather than trusting the stale number.
 | [topo2stl.py](topo2stl.py) | ~1911 | Everything: CLI, download, cache, mesh build, buildings, emboss, tiling, STL write. Single file by design — see "Why one file" below. |
 | [viewer.py](viewer.py) | ~283 | stdlib-only HTTP server: serves `viewer.html`, the STL, the `.topo.json` sidecar, and a `/regen` endpoint that shells out to `topo2stl.py`. |
 | [viewer.html](viewer.html) | ~660 | The viewer's page: three.js render loop, HUD, Area pan/zoom panel, regen/save-as UI. All JS is inline in this one file. |
+| [tileset_preview.py](tileset_preview.py) | ~85 | Standalone script: merges a `--tile` run's tiles back into one non-manifold preview STL (positioned as assembled, not booleaned) so `viewer.py` can show the whole map. Imports `write_binary_stl`/`launch_viewer` from `topo2stl.py`. |
 | [docs/buildings-scope.md](docs/buildings-scope.md) | — | Design notes for the buildings feature (why OSM vs raster, etc). Background reading, not code. |
 | [BACKLOG.md](BACKLOG.md) | — | Known issues + unimplemented ideas. Check before "fixing" something that's a known, accepted limitation (e.g. sharp-peak stringing). |
 | `cache/` | — | Downloaded elevation/building/vegetation grids as `.npy`, keyed by a hash of request params. Gitignored. Safe to delete; everything re-downloads. |

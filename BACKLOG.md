@@ -46,9 +46,12 @@ Loose list of things to do, roughly in priority order.
   keyed with peg/socket seams molded into the base (`--bed-size`,
   `--tile-peg-diameter/-length/-spacing`, `--tile-clearance`), plus a
   `.tileset.json` manifest and a small row-col ID engraved low on each tile's
-  south wall. Next:
-  - viewer support for opening a whole tileset assembled in place (right now
-    `--view` after `--tile` just tells you to preview one tile file).
+  south wall. `tileset_preview.py` merges the tiles into one non-manifold
+  preview STL at their assembled positions so `viewer.py` can show the whole
+  map (`python tileset_preview.py NAME.tileset.json --view`). Next:
+  - fold that into `viewer.py` directly (open a `.tileset.json` as the
+    target, assemble in memory - no `.preview.stl` written to disk, and
+    Regenerate could re-run the whole `--tile` command).
   - drop the "one bare peg centred" fallback for a very short seam in favour
     of a slightly larger minimum tile size check.
   - a building footprint straddling a seam is clipped independently by each

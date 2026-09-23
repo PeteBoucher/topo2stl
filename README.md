@@ -264,6 +264,23 @@ this up front and tells you to add more `--tile` rows/cols or shrink
 `--model-width` if not. A building footprint that straddles a seam is simply
 clipped by each tile it touches, like the base plate's own edge.
 
+### Previewing the assembled tileset
+
+`viewer.py` only shows one STL at a time, so to look at the *whole* map
+before printing/gluing, merge the tiles back into one preview file with
+[tileset_preview.py](tileset_preview.py):
+
+```text
+python tileset_preview.py granada.tileset.json --view
+```
+
+This places each tile STL at its assembled position and opens the result in
+the usual viewer. It's for looking only — pegs/sockets aren't booleaned
+across tiles here (the tiles are just placed side by side), so don't slice
+`granada.preview.stl` for printing; print the individual tile files. Add
+`--gap 2` to open up a couple of mm between tiles in the preview if you want
+the seams easier to pick out.
+
 ---
 
 ## How it works

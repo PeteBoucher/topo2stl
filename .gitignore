@@ -17,6 +17,7 @@ cache/
 *.topo.json
 *.CREDITS.txt
 *.stl.tmp
+*.tileset.json
 
 # OS / editor
 .DS_Store
