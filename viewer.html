@@ -314,13 +314,23 @@ let currentName = null;
 let firstLoad = true;
 
 async function poll() {
+  let v;
   try {
-    const v = await (await fetch('/version', { cache: 'no-store' })).text();
-    const name = v.split('|').slice(1).join('|');
-    window.__fname = name;
-    $('fname').textContent = name || '-';
-    const missing = v.startsWith('0|');
-    if (v !== currentVersion && !missing) {
+    v = await (await fetch('/version', { cache: 'no-store' })).text();
+  } catch (e) {
+    $('err').textContent = 'viewer server not responding';
+    setTimeout(poll, 1000);
+    return;
+  }
+  const name = v.split('|').slice(1).join('|');
+  window.__fname = name;
+  $('fname').textContent = name || '-';
+  const missing = v.startsWith('0|');
+  if (v !== currentVersion && !missing) {
+    // a separate try: the server responded fine, so a failure here means the
+    // file isn't parseable STL (e.g. pointed at the wrong kind of file) -
+    // worth a different message than "not responding".
+    try {
       const buf = await (await fetch('/model.stl', { cache: 'no-store' })).arrayBuffer();
       const geo = loader.parse(buf);
       setModel(geo, firstLoad || name !== currentName);
@@ -330,11 +340,11 @@ async function poll() {
       currentName = name;
       firstLoad = false;
       $('err').textContent = '';
-    } else if (missing) {
-      $('err').textContent = 'waiting for ' + (name || 'file') + ' ...';
+    } catch (e) {
+      $('err').textContent = `couldn't read ${name || 'the model'} as STL (${e.message || e})`;
     }
-  } catch (e) {
-    $('err').textContent = 'viewer server not responding';
+  } else if (missing) {
+    $('err').textContent = 'waiting for ' + (name || 'file') + ' ...';
   }
   setTimeout(poll, 1000);
 }

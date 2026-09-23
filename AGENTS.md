@@ -16,7 +16,7 @@ rather than trusting the stale number.
 | File | Lines | Role |
 | --- | --- | --- |
 | [topo2stl.py](topo2stl.py) | ~1911 | Everything: CLI, download, cache, mesh build, buildings, emboss, tiling, STL write. Single file by design — see "Why one file" below. |
-| [viewer.py](viewer.py) | ~283 | stdlib-only HTTP server: serves `viewer.html`, the STL, the `.topo.json` sidecar, and a `/regen` endpoint that shells out to `topo2stl.py`. |
+| [viewer.py](viewer.py) | ~380 | stdlib-only HTTP server: serves `viewer.html`, the STL, the `.topo.json` sidecar, and a `/regen` endpoint that shells out to `topo2stl.py`. Given a `.tileset.json` instead of an STL, `_resolve_target()` shells out to `tileset_preview.py` first and serves the merged result. |
 | [viewer.html](viewer.html) | ~660 | The viewer's page: three.js render loop, HUD, Area pan/zoom panel, regen/save-as UI. All JS is inline in this one file. |
 | [tileset_preview.py](tileset_preview.py) | ~130 | Standalone script: merges a `--tile` run's tiles back into one non-manifold preview STL (positioned as assembled, not booleaned) so `viewer.py` can show the whole map, plus a `.topo.json` sidecar with a seam polyline per internal wall (`_wall_profile`, traced from the tile mesh's own top-edge vertices - not synthesized) that `viewer.html`'s Seams overlay draws. Imports `write_binary_stl`/`launch_viewer` from `topo2stl.py`. |
 | [docs/buildings-scope.md](docs/buildings-scope.md) | — | Design notes for the buildings feature (why OSM vs raster, etc). Background reading, not code. |
@@ -231,3 +231,14 @@ row: Fit/Relief/Wireframe/Spin/Coords/Area), `#area` (pan/zoom panel),
   grid isn't meaningful) — if you add a field one of these needs for a new
   feature, check whether it belongs in `write_tiles`' per-tile `meta`,
   `tileset_preview.py`'s merged `meta`, or both.
+- `viewer.py NAME.tileset.json` works because `main()` runs the target
+  through `_resolve_target()` before anything else touches it - a
+  `.tileset.json` isn't a mesh, so that shells out to `tileset_preview.py`
+  and serves the merged `.preview.stl` it produces instead. If you add
+  another non-STL thing `viewer.py` should accept, it goes there, not deeper
+  in `Handler` (which only ever deals with a real STL path by the time it
+  runs). Related: `poll()` in viewer.html deliberately reports "couldn't read
+  ... as STL" separately from "viewer server not responding" - the former
+  used to be misreported as the latter, which is exactly how someone points
+  `viewer.py` at a manifest and gets a confusing connectivity-sounding error
+  for what's actually a parse failure.

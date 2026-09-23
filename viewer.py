@@ -9,6 +9,9 @@ re-run topo2stl.py and overwrite that file, the view reloads automatically
 (camera is kept), so you can dial in --z-exaggeration / --model-width / --base
 without touching the slicer.
 
+Point it at a NAME.tileset.json instead of an .stl and it merges the tiles
+into a preview via tileset_preview.py automatically before serving it.
+
 A later `viewer.py other.stl` just retargets an already-running server on the
 same port rather than restarting it - fine for a new model, but it means a
 server started before a viewer.py/topo2stl.py code change keeps running the
@@ -335,6 +338,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def _resolve_target(path: Path) -> Path:
+    """A .tileset.json isn't itself a mesh viewer.py can serve - transparently
+    merge it via tileset_preview.py (which also (re)writes the merged
+    preview's sidecar, so Regenerate/Save-as work) and view that instead, so
+    `viewer.py NAME.tileset.json` just does the right thing rather than
+    failing to parse it as an STL."""
+    if not path.name.endswith(".tileset.json"):
+        return path
+    if not TILESET_PREVIEW.exists():
+        sys.exit(f"{path.name} is a tileset manifest, not an STL - "
+                 "tileset_preview.py (needed to merge it) isn't next to viewer.py")
+    preview = path.with_name(path.name[:-len(".tileset.json")] + ".preview.stl")
+    print(f"{path.name} is a tileset manifest - merging into {preview.name} ...")
+    rc = subprocess.run([sys.executable, str(TILESET_PREVIEW), str(path),
+                        "-o", str(preview)], cwd=str(TOPO2STL.parent)).returncode
+    if rc != 0:
+        sys.exit(f"tileset_preview.py failed (exit {rc})")
+    return preview
+
+
 def _port_alive(port: int) -> bool:
     with socket.socket() as s:
         s.settimeout(0.3)
@@ -374,8 +397,9 @@ def main(argv=None):
 
     if not argv or argv[0].startswith("--"):
         sys.exit("usage: viewer.py OUTPUT.stl [--port N] [--no-open] [--replace]\n"
+                 "       viewer.py NAME.tileset.json [...]  (merged automatically)\n"
                  "       viewer.py --kill [--port N]")
-    Handler.stl_path = Path(argv[0]).resolve()
+    Handler.stl_path = _resolve_target(Path(argv[0]).resolve())
     no_open = "--no-open" in argv
 
     if "--replace" in argv and _quit_running(port):

@@ -141,15 +141,17 @@ Each `topo2stl.py` run writes a small `<name>.topo.json` sidecar next to the STL
 (bounding box, settings, and the command line, for the viewer's Regenerate).
 It's harmless to delete; slicers ignore it.
 
-Regenerate/Save-as also work on a tileset's merged preview (open it with
-`tileset_preview.py NAME.tileset.json --view`, not one of the individual
-`_r#c#.stl` tiles) — the button relabels to **Regenerate NxM tileset**, and
-panning/zooming/saving re-runs the whole `--tile` command (rewriting every
-tile) followed by `tileset_preview.py` automatically, then switches the
-viewer to the fresh merged preview. Opening one bare tile file directly
-disables Regenerate with a note pointing you at the merged preview instead,
-since panning that tile's own tiny bbox and re-splitting it into more tiles
-isn't a sensible operation.
+Regenerate/Save-as also work on a tileset's merged preview — open it with
+`tileset_preview.py NAME.tileset.json --view`, or just `viewer.py
+NAME.tileset.json` directly (it isn't itself a mesh, so viewer.py merges it
+via `tileset_preview.py` first automatically, same as `--view` does). Either
+way, not one of the individual `_r#c#.stl` tiles: the button relabels to
+**Regenerate NxM tileset**, and panning/zooming/saving re-runs the whole
+`--tile` command (rewriting every tile) followed by `tileset_preview.py`
+automatically, then switches the viewer to the fresh merged preview. Opening
+one bare tile file directly disables Regenerate with a note pointing you at
+the merged preview instead, since panning that tile's own tiny bbox and
+re-splitting it into more tiles isn't a sensible operation.
 
 > The viewer loads three.js from a CDN, so it needs an internet connection the
 > first time a browser caches it.
@@ -285,12 +287,20 @@ clipped by each tile it touches, like the base plate's own edge.
 
 ### Previewing the assembled tileset
 
-`viewer.py` only shows one STL at a time, so to look at the *whole* map
+`viewer.py` only shows one mesh at a time, so to look at the *whole* map
 before printing/gluing, merge the tiles back into one preview file with
 [tileset_preview.py](tileset_preview.py):
 
 ```text
 python tileset_preview.py granada.tileset.json --view
+```
+
+or just point `viewer.py` at the manifest directly - it isn't an STL, so
+`viewer.py` runs `tileset_preview.py` on it automatically before serving the
+result, same as above:
+
+```text
+python viewer.py granada.tileset.json
 ```
 
 This places each tile STL at its assembled position and opens the result in
