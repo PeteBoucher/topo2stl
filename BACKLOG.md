@@ -49,7 +49,11 @@ Loose list of things to do, roughly in priority order.
 - **Multi-tile printing** — done: `--tile ROWSxCOLS` splits a model too big
   for one bed into a grid of tiles cut from one continuous elevation field,
   keyed with peg/socket seams molded into the base (`--bed-size`,
-  `--tile-peg-diameter/-length/-spacing`, `--tile-clearance`), plus a
+  `--tile-peg-diameter/-length/-spacing`, `--tile-clearance`, `--tile-size`
+  as an easier way to hit a target tile size than computing `--model-width`
+  by hand - `--model-width` is the *whole assembled map*, a mistake caught
+  in the wild: `--tile 2x2 --model-width 200` gives ~100 mm tiles, not
+  200 mm ones), plus a
   `.tileset.json` manifest and a small row-col ID engraved low on each tile's
   south wall. `tileset_preview.py` merges the tiles into one non-manifold
   preview STL at their assembled positions so `viewer.py` can show the whole

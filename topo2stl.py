@@ -1631,6 +1631,14 @@ def parse_args(argv=None):
                         "peg/socket seams molded into the base (e.g. 2x2, 2x6)")
     p.add_argument("--bed-size", type=float, default=220.0,
                    help="usable print-bed size in mm (square) each tile must fit")
+    p.add_argument("--tile-size", type=float,
+                   help="target size of each tile in mm (E-W) - an easier "
+                        "alternative to computing --model-width by hand: "
+                        "sets --model-width to tile-size * cols (overrides "
+                        "--model-width if both are given). Tile widths vary "
+                        "by a fraction of a mm across the grid, so leave a "
+                        "couple mm of headroom under --bed-size rather than "
+                        "matching it exactly")
     p.add_argument("--tile-peg-diameter", type=float, default=5.0,
                    help="tile seam keying peg diameter in mm (base of the taper)")
     p.add_argument("--tile-peg-length", type=float, default=3.0,
@@ -1686,6 +1694,15 @@ def main(argv=None):
     if a.source == "tessadem" and not (-80 <= min_lat and max_lat <= 84):
         raise SystemExit("TessaDEM latitude coverage is -80 to 84")
     bbox = (min_lat, min_lon, max_lat, max_lon)
+
+    if a.tile and a.tile_size:
+        try:
+            tcols = int(a.tile.lower().split("x")[1])
+        except (IndexError, ValueError):
+            raise SystemExit("--tile needs ROWSxCOLS, e.g. 2x2")
+        a.model_width = a.tile_size * tcols
+        print(f"--tile-size {a.tile_size:.1f} mm x {tcols} cols "
+              f"-> --model-width {a.model_width:.1f} mm")
 
     if "x" in a.grid.lower():
         rows, cols = (int(v) for v in a.grid.lower().split("x"))

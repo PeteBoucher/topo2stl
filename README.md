@@ -90,7 +90,7 @@ python topo2stl.py --bbox 36.98,-3.45,37.10,-3.28 --ign-res 5 \
 | `--building-min-area` / `--building-simplify` | osm: drop footprints under N m² (10); simplify tolerance in model mm (0.4). |
 | `--building-roofs` | osm: `flat` (default) or `lidar` — clip prisms to the real LiDAR roofscape (Spain). |
 | `--trees` | Add tree canopy from IGN's vegetation DSM (Spain). `--tree-exaggeration`, `--tree-min-height`. |
-| `--tile ROWSxCOLS` | Split the model into a grid of tiles that each fit `--bed-size`, keyed with peg/socket seams — see below. |
+| `--tile ROWSxCOLS` | Split the model into a grid of tiles that each fit `--bed-size`, keyed with peg/socket seams — see below. Pair with `--tile-size` (mm per tile) rather than `--model-width` (the whole assembled map's width, not one tile's). |
 | `--emboss-coords` | Engrave each side wall's edge coordinate (see below). |
 | `--emboss-style` | `engraved` (cut in, default — needs `manifold3d`) or `raised` (stands proud). |
 | `--emboss-height` / `--emboss-depth` | Text cap height (mm, default 4) and engraving/relief depth (mm, default 0.6). |
@@ -248,16 +248,24 @@ sloping terrain, so it prints crisply.
 
 `--tile ROWSxCOLS` splits a model too big for one print bed into a grid of
 tiles (e.g. `--tile 2x2`, `--tile 2x6`) that you glue together afterwards.
-`--model-width` describes the *whole assembled map*; `--tile` slices it up.
+`--model-width` describes the *whole assembled map*, not one tile - `--tile`
+slices that total up, so with `--tile 2x2` a `--model-width 200` gives four
+~100 mm tiles, not four 200 mm ones. To size tiles directly instead, use
+`--tile-size` (mm per tile) and skip `--model-width` entirely:
 
 ```text
-topo2stl.py --bbox 37.83,-4.85,37.94,-4.71 --model-width 400 --tile 2x2 \
+topo2stl.py --bbox 37.83,-4.85,37.94,-4.71 --tile 2x2 --tile-size 215 \
             -o granada.stl
 ```
 
-writes `granada_r1c1.stl` … `granada_r2c2.stl`, one `.topo.json` sidecar per
-tile, a shared `granada.CREDITS.txt`, and a `granada.tileset.json` manifest
-listing every tile's file, bbox and size.
+(`--tile-size 215 --tile 2x2` sets `--model-width` to `215 * 2 = 430` for
+you - leave a couple of mm under `--bed-size` since tile widths vary by a
+fraction of a mm across the grid; topo2stl.py errors out before doing any
+work if a tile would still be too big.)
+
+This writes `granada_r1c1.stl` … `granada_r2c2.stl`, one `.topo.json`
+sidecar per tile, a shared `granada.CREDITS.txt`, and a
+`granada.tileset.json` manifest listing every tile's file, bbox and size.
 
 Two things keep the seams as invisible as possible:
 
