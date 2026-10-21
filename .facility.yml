@@ -7,6 +7,9 @@ environment:
   seed: ".venv/bin/python topo2stl.py --center 37.884,-4.779 --width-km 3 --model-width 100 -o preview.stl"
   start: "nohup .venv/bin/python viewer.py preview.stl --no-open --replace > .viewer.log 2>&1 &"
   ready: "curl -fsS http://127.0.0.1:8731/ > /dev/null"
+  secrets:
+    - ANTHROPIC_API_KEY
+    - OPENAI_API_KEY
   services:
     app:
       port: 8731
