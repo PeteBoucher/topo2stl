@@ -19,6 +19,9 @@ cache/
 *.stl.tmp
 *.tileset.json
 
+# Log files
+.viewer.log
+
 # OS / editor
 .DS_Store
 *.swp
