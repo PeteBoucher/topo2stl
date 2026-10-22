@@ -28,8 +28,8 @@ python topo2stl.py --center 37.884,-4.779 --width-km 12 \
 `--view` opens the preview at <http://localhost:8731/>. Leave it open and re-run
 `topo2stl.py` with different settings — it reloads automatically.
 
-Core dependencies are just `numpy` and `requests`. `manifold3d` is only needed
-for `--emboss-coords`.
+Core dependencies are `numpy` and `requests`. `manifold3d` is needed for POI
+pins, OSM buildings, tiled output, and engraved coordinates.
 
 ---
 
@@ -90,6 +90,7 @@ python topo2stl.py --bbox 36.98,-3.45,37.10,-3.28 --ign-res 5 \
 | `--building-min-area` / `--building-simplify` | osm: drop footprints under N m² (10); simplify tolerance in model mm (0.4). |
 | `--building-roofs` | osm: `flat` (default) or `lidar` — clip prisms to the real LiDAR roofscape (Spain). |
 | `--trees` | Add tree canopy from IGN's vegetation DSM (Spain). `--tree-exaggeration`, `--tree-min-height`. |
+| `--pin LAT,LON` | Add a small raised marker at a known point for orienting the finished print; repeatable — see below. |
 | `--tile ROWSxCOLS` | Split the model into a grid of tiles that each fit `--bed-size`, keyed with peg/socket seams — see below. Pair with `--tile-size` (mm per tile) rather than `--model-width` (the whole assembled map's width, not one tile's). |
 | `--emboss-coords` | Engrave each side wall's edge coordinate (see below). |
 | `--emboss-style` | `engraved` (cut in, default — needs `manifold3d`) or `raised` (stands proud). |
@@ -156,6 +157,9 @@ re-splitting it into more tiles isn't a sensible operation.
 > The viewer loads three.js from a CDN, so it needs an internet connection the
 > first time a browser caches it.
 
+The viewer fetches its model and control endpoints relative to the page URL, so
+it also works when served below a path-prefix proxy such as Facility Preview.
+
 ---
 
 ## Buildings
@@ -215,6 +219,29 @@ Notes:
 - Best with a low `--z-exaggeration` (1–1.5) and a slightly thicker `--base`.
 - `--buildings` / `--trees` force 5 m elevation data. The `raster` sources and
   `--trees` are Spain only; `osm` buildings work anywhere OSM has footprints.
+
+---
+
+## POI reference pins
+
+`--pin LAT,LON` fuses a small raised marker at a known point on the terrain,
+giving the finished print an immediate orientation reference:
+
+```bash
+python topo2stl.py --center 37.879,-4.779 --width-km 2 \
+  --model-width 180 --pin 37.8789,-4.7794 \
+  -o cordoba.stl --view
+```
+
+The marker is a flat-topped taper with a 3 mm base and rises 3 mm above the
+local surface: wide enough for a typical 0.4 mm nozzle, with no point to string
+or support to remove. Its size is in printed millimetres and is not affected by
+`--z-exaggeration`. Repeat `--pin` to mark more than one POI.
+
+The coordinate must fall inside the map bounding box. The pin is embedded
+slightly and unioned into the terrain as one printable solid (`manifold3d` is
+required). On a multi-tile map, a pin crossing a seam is clipped between the
+affected tiles in the assembled coordinate frame, so both halves line up.
 
 ---
 
@@ -334,7 +361,8 @@ mode - the gap already shows where the cuts are).
 3. Build the mesh: triangulated top surface + four vertical walls + flat bottom,
    consistently wound outward. Longitude is `cos(latitude)`-corrected so
    proportions stay true.
-4. Optionally engrave the coordinates via CSG.
+4. Optionally union buildings and POI pins, then engrave the coordinates via
+   CSG.
 5. Write a binary STL in millimetres, sitting on the `z = 0` plane.
 
 ```text

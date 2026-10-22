@@ -11,7 +11,8 @@ Pipeline:
                     paid API key; tiled to stay under the per-request limits.
   3. Turn the grid into a watertight "solid block with base" mesh:
      draped top surface + vertical side walls + flat bottom.
-  4. Write a binary STL.
+  4. Optionally fuse buildings, printable POI pins, and coordinate labels.
+  5. Write a binary STL.
 
 The raw elevation grid is cached on disk (./cache) so re-running with different
 model settings does not re-download.
@@ -942,7 +943,8 @@ def _footprints_in_bbox(footprints: list, bbox, pad_deg: float = 0.001) -> list:
 
 
 def write_tiles(a, bbox, grid_m: np.ndarray, overlay_m, osm_footprints,
-                lidar_roofs: bool, out: Path, credit: str, stl_header: str):
+                pins: list[dict], lidar_roofs: bool, out: Path,
+                credit: str, stl_header: str):
     """Split the model into a's --tile ROWSxCOLS grid and write one STL (plus
     sidecar meta) per tile, keyed together with peg/socket seams."""
     if not _have_manifold():
@@ -975,6 +977,7 @@ def write_tiles(a, bbox, grid_m: np.ndarray, overlay_m, osm_footprints,
 
     xs_global = np.linspace(0.0, a.model_width, cols)
     ys_global = np.linspace(0.0, model_h_mm, rows)[::-1]
+    placed_pins = _prepare_pins(pins, bbox, a.model_width, model_h_mm, z_main)
     row_ranges = _split_range(rows, trows, "row")
     col_ranges = _split_range(cols, tcols, "col")
 
@@ -1035,6 +1038,10 @@ def write_tiles(a, bbox, grid_m: np.ndarray, overlay_m, osm_footprints,
                     a.building_simplify,
                     roof_surface_tris=roof_tris_tile, roof_h_m=roof_h_tile)
 
+            tris = add_pins(tris, placed_pins,
+                            float(xs_global[c0]), float(ys_global[r1]),
+                            Wd, Hd)
+
             pegs, sockets = _tile_seam_geoms(
                 ti, tj, trows, tcols, Wd, Hd, a.base, peg_r,
                 a.tile_peg_length, a.tile_clearance, a.tile_peg_spacing, margin)
@@ -1060,6 +1067,7 @@ def write_tiles(a, bbox, grid_m: np.ndarray, overlay_m, osm_footprints,
                 "base_mm": a.base,
                 "buildings": (a.building_source if a.buildings else None),
                 "trees": bool(a.trees),
+                "pins": [[p["lat"], p["lon"]] for p in pins],
                 "generator": "topo2stl",
                 "attribution": credit,
                 "argv": list(sys.argv[1:]),
@@ -1237,6 +1245,123 @@ def _manifold_to_soup(res) -> np.ndarray:
     return out[~degen]
 
 
+# --------------------------------------------------------------------------- #
+# Printable POI pins
+# --------------------------------------------------------------------------- #
+PIN_BASE_RADIUS_MM = 1.5
+PIN_TOP_RADIUS_MM = 0.75
+PIN_HEIGHT_MM = 3.0
+PIN_EMBED_MM = 0.3
+PIN_SEGMENTS = 24
+
+
+def _parse_pins(values: list[str], bbox) -> list[dict]:
+    """Parse repeatable ``--pin LAT,LON`` values before terrain download."""
+    if not values:
+        return []
+    if not _have_manifold():
+        raise SystemExit("--pin needs manifold3d:\n"
+                         "  ./.venv/bin/pip install -r requirements.txt")
+
+    min_lat, min_lon, max_lat, max_lon = bbox
+    pins = []
+    for raw in values:
+        fields = [v.strip() for v in raw.split(",")]
+        if len(fields) != 2 or any(not v for v in fields):
+            raise SystemExit(f"--pin {raw!r}: expected LAT,LON")
+        try:
+            lat, lon = (float(v) for v in fields)
+        except ValueError:
+            raise SystemExit(
+                f"--pin {raw!r}: latitude and longitude must be numbers") from None
+        if not all(math.isfinite(v) for v in (lat, lon)):
+            raise SystemExit(f"--pin {raw!r}: values must be finite")
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            raise SystemExit(f"--pin {raw!r}: invalid latitude/longitude")
+        if not (min_lat <= lat <= max_lat and min_lon <= lon <= max_lon):
+            raise SystemExit(f"--pin {raw!r}: coordinate is outside the map bbox")
+        pins.append({"lat": lat, "lon": lon})
+    return pins
+
+
+def _terrain_min_under(z_mm: np.ndarray, W: float, H: float,
+                       x0: float, y0: float, x1: float, y1: float) -> float:
+    """Lowest sampled terrain vertex below a model-space rectangle."""
+    rows, cols = z_mm.shape
+    c0 = int(math.floor(np.clip(x0 / W, 0.0, 1.0) * (cols - 1)))
+    c1 = int(math.ceil(np.clip(x1 / W, 0.0, 1.0) * (cols - 1))) + 1
+    r0 = int(math.floor((1.0 - np.clip(y1 / H, 0.0, 1.0)) * (rows - 1)))
+    r1 = int(math.ceil((1.0 - np.clip(y0 / H, 0.0, 1.0)) * (rows - 1))) + 1
+    block = z_mm[max(0, r0):min(rows, r1), max(0, c0):min(cols, c1)]
+    return float(block.min()) if block.size else float(z_mm.min())
+
+
+def _prepare_pins(pins: list[dict], bbox, W: float, H: float,
+                  z_mm: np.ndarray) -> list[dict]:
+    """Build fixed-size tapered pins once in the assembled model frame.
+
+    Tiled output clips this exact geometry per tile, so a pin crossing a seam
+    stays aligned when the printed pieces are assembled.
+    """
+    min_lat, min_lon, max_lat, max_lon = bbox
+    placed = []
+    for pin in pins:
+        target_x = (pin["lon"] - min_lon) / (max_lon - min_lon) * W
+        target_y = (pin["lat"] - min_lat) / (max_lat - min_lat) * H
+        seat_z = _terrain_min_under(
+            z_mm, W, H, target_x - PIN_BASE_RADIUS_MM,
+            target_y - PIN_BASE_RADIUS_MM, target_x + PIN_BASE_RADIUS_MM,
+            target_y + PIN_BASE_RADIUS_MM)
+        v = np.asarray(_cyl_tris(
+            (target_x, target_y, seat_z - PIN_EMBED_MM), (0, 0, 1),
+            PIN_BASE_RADIUS_MM, PIN_TOP_RADIUS_MM,
+            PIN_HEIGHT_MM + PIN_EMBED_MM, segments=PIN_SEGMENTS),
+            dtype=np.float32)
+        bounds = (v.reshape(-1, 3).min(0), v.reshape(-1, 3).max(0))
+        placed.append({**pin, "tris": v, "bounds": bounds})
+        print(f"Pin: {pin['lat']:.5f},{pin['lon']:.5f} -> "
+              f"{2 * PIN_BASE_RADIUS_MM:.1f} mm base, "
+              f"{PIN_HEIGHT_MM:.1f} mm raised")
+    return placed
+
+
+def add_pins(base_tris, pins: list[dict], x_offset: float,
+             y_offset: float, W: float, H: float) -> np.ndarray:
+    """Clip prepared pin geometry to this model/tile and union it in."""
+    if not pins:
+        return np.asarray(base_tris, dtype=np.float32)
+    import manifold3d as m3d
+
+    parts = []
+    for pin in pins:
+        lo, hi = pin["bounds"]
+        if (hi[0] < x_offset or lo[0] > x_offset + W or
+                hi[1] < y_offset or lo[1] > y_offset + H):
+            continue
+        v = pin["tris"].copy()
+        v[:, :, 0] -= x_offset
+        v[:, :, 1] -= y_offset
+        pin_m = _soup_to_manifold(v)
+        clip_z = max(float(hi[2]) + 1.0, 1.0)
+        clip = m3d.Manifold.cube([W, H, clip_z])
+        part = pin_m ^ clip
+        if not part.is_empty():
+            parts.append(part)
+
+    if not parts:
+        return np.asarray(base_tris, dtype=np.float32)
+    terrain = _soup_to_manifold(base_tris)
+    marks = m3d.Manifold.batch_boolean(parts, m3d.OpType.Add)
+    res = terrain + marks
+    if res.is_empty() or res.status() != m3d.Error.NoError:
+        raise SystemExit("pin union produced an invalid mesh")
+    print(f"  fused {len(parts)} pin(s) into terrain")
+    return _manifold_to_soup(res)
+
+
+# --------------------------------------------------------------------------- #
+# OSM building mesh union
+# --------------------------------------------------------------------------- #
 def add_osm_buildings(base_tris: list, info: dict, bbox, footprints: list,
                       level_h: float, default_h: float, exaggeration: float,
                       min_area_m2: float, simplify_mm: float,
@@ -1372,6 +1497,9 @@ def add_osm_buildings(base_tris: list, info: dict, bbox, footprints: list,
     return _manifold_to_soup(res)
 
 
+# --------------------------------------------------------------------------- #
+# Embossed corner coordinates (continued)
+# --------------------------------------------------------------------------- #
 def _boolean_text(base_tris: list, boxes: list, op: str) -> np.ndarray:
     """base - text  (op='sub')  or  base + text  (op='add'), via manifold3d."""
     import manifold3d as m3d
@@ -1624,6 +1752,10 @@ def parse_args(argv=None):
                    help="vertical multiplier for trees only")
     p.add_argument("--tree-min-height", type=float, default=2.0,
                    help="drop vegetation cells below this many metres")
+    p.add_argument("--pin", action="append", default=[], metavar="LAT,LON",
+                   help="add a 3 mm-wide, 3 mm-high tapered reference marker "
+                        "at this coordinate; repeat for multiple pins (needs "
+                        "manifold3d)")
 
     p.add_argument("--tile", help="ROWSxCOLS - split the model into a grid "
                         "of tiles that each fit --bed-size, cut from one "
@@ -1694,6 +1826,7 @@ def main(argv=None):
     if a.source == "tessadem" and not (-80 <= min_lat and max_lat <= 84):
         raise SystemExit("TessaDEM latitude coverage is -80 to 84")
     bbox = (min_lat, min_lon, max_lat, max_lon)
+    pins = _parse_pins(a.pin, bbox)
 
     if a.tile and a.tile_size:
         try:
@@ -1820,8 +1953,8 @@ def main(argv=None):
         osm=(a.buildings and a.building_source == "osm"))
 
     if a.tile:
-        write_tiles(a, bbox, grid_m, overlay_m, osm_footprints, lidar_roofs,
-                   out, credit, stl_header)
+        write_tiles(a, bbox, grid_m, overlay_m, osm_footprints, pins,
+                    lidar_roofs, out, credit, stl_header)
         if a.view:
             print("  note: --view shows a single STL; pick one tile file to preview")
         return
@@ -1844,6 +1977,11 @@ def main(argv=None):
             a.building_level_height, a.building_default_height,
             a.building_exaggeration, a.building_min_area, a.building_simplify,
             roof_surface_tris=roof_tris, roof_h_m=roof_h)
+
+    placed_pins = _prepare_pins(
+        pins, bbox, info["model_w"], info["model_h"], info["z_mm"])
+    tris = add_pins(tris, placed_pins, 0.0, 0.0,
+                    info["model_w"], info["model_h"])
 
     if a.emboss_coords:
         tris = emboss_corner_coords(tris, info, bbox, a.emboss_height,
@@ -1869,6 +2007,7 @@ def main(argv=None):
         "buildings": (a.building_source if a.buildings else None),
         "building_exaggeration": (a.building_exaggeration if a.buildings else None),
         "trees": bool(a.trees),
+        "pins": [[p["lat"], p["lon"]] for p in pins],
         "generator": "topo2stl",
         "attribution": credit,
         "argv": list(sys.argv[1:]),          # lets viewer.py re-run for a new bbox
