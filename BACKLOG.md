@@ -25,9 +25,9 @@ Loose list of things to do, roughly in priority order.
     exact precision (slicer-repairable); OSM buildings seat on terrain+tree
     overlay (buildings on canopy cells float ~tree height).
   - [ ] Catastro footprints (100% Spain coverage + floor counts, needs UTM).
-  - [x] `--landmark "lat,lon,file.stl[,scale][,rotation]"` — fuse repeatable
-    custom monument/reference meshes into the terrain, including across tile
-    seams.
+  - [x] `--pin LAT,LON` — fuse a small printable reference marker into the
+    terrain, including across tile seams.
+  - [ ] `--landmark "lat,lon,file.stl"` — drop a custom monument mesh.
   - [ ] Water mask — recess rivers/coast as a channel (Micropolitan style).
 - **viewer Area picker follow-ups** — done: pan/zoom bbox + Regenerate in the
   viewer; **Save as** to build the pending area to a new named file instead of

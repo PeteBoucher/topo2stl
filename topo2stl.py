@@ -11,7 +11,7 @@ Pipeline:
                     paid API key; tiled to stay under the per-request limits.
   3. Turn the grid into a watertight "solid block with base" mesh:
      draped top surface + vertical side walls + flat bottom.
-  4. Optionally fuse buildings, custom landmark STLs, and coordinate labels.
+  4. Optionally fuse buildings, printable POI pins, and coordinate labels.
   5. Write a binary STL.
 
 The raw elevation grid is cached on disk (./cache) so re-running with different
@@ -943,7 +943,7 @@ def _footprints_in_bbox(footprints: list, bbox, pad_deg: float = 0.001) -> list:
 
 
 def write_tiles(a, bbox, grid_m: np.ndarray, overlay_m, osm_footprints,
-                landmarks: list[dict], lidar_roofs: bool, out: Path,
+                pins: list[dict], lidar_roofs: bool, out: Path,
                 credit: str, stl_header: str):
     """Split the model into a's --tile ROWSxCOLS grid and write one STL (plus
     sidecar meta) per tile, keyed together with peg/socket seams."""
@@ -977,8 +977,7 @@ def write_tiles(a, bbox, grid_m: np.ndarray, overlay_m, osm_footprints,
 
     xs_global = np.linspace(0.0, a.model_width, cols)
     ys_global = np.linspace(0.0, model_h_mm, rows)[::-1]
-    placed_landmarks = _prepare_landmarks(
-        landmarks, bbox, a.model_width, model_h_mm, z_main)
+    placed_pins = _prepare_pins(pins, bbox, a.model_width, model_h_mm, z_main)
     row_ranges = _split_range(rows, trows, "row")
     col_ranges = _split_range(cols, tcols, "col")
 
@@ -1039,9 +1038,9 @@ def write_tiles(a, bbox, grid_m: np.ndarray, overlay_m, osm_footprints,
                     a.building_simplify,
                     roof_surface_tris=roof_tris_tile, roof_h_m=roof_h_tile)
 
-            tris = add_landmarks(tris, placed_landmarks,
-                                 float(xs_global[c0]), float(ys_global[r1]),
-                                 Wd, Hd)
+            tris = add_pins(tris, placed_pins,
+                            float(xs_global[c0]), float(ys_global[r1]),
+                            Wd, Hd)
 
             pegs, sockets = _tile_seam_geoms(
                 ti, tj, trows, tcols, Wd, Hd, a.base, peg_r,
@@ -1068,7 +1067,7 @@ def write_tiles(a, bbox, grid_m: np.ndarray, overlay_m, osm_footprints,
                 "base_mm": a.base,
                 "buildings": (a.building_source if a.buildings else None),
                 "trees": bool(a.trees),
-                "landmarks": len(landmarks),
+                "pins": [[p["lat"], p["lon"]] for p in pins],
                 "generator": "topo2stl",
                 "attribution": credit,
                 "argv": list(sys.argv[1:]),
@@ -1247,106 +1246,42 @@ def _manifold_to_soup(res) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
-# Custom landmark models
+# Printable POI pins
 # --------------------------------------------------------------------------- #
-def _read_landmark_stl(path: Path) -> np.ndarray:
-    """Read a binary or ASCII STL into the triangle-soup convention used here.
-
-    STL has no reliable format marker (a binary header is allowed to begin with
-    ``solid``), so prefer binary only when its triangle count matches the file and
-    otherwise fall back to ASCII vertex records.
-    """
-    try:
-        data = path.read_bytes()
-    except OSError as e:
-        raise ValueError(f"could not read {path}: {e}") from e
-
-    tris = None
-    if len(data) >= 84:
-        n = struct.unpack_from("<I", data, 80)[0]
-        expected = 84 + n * 50
-        if n > 0 and expected == len(data):
-            dt = np.dtype([("normal", "<f4", (3,)),
-                           ("verts", "<f4", (3, 3)),
-                           ("attr", "<u2")])
-            recs = np.frombuffer(data, dtype=dt, count=n, offset=84)
-            tris = recs["verts"].astype(np.float32, copy=True)
-
-    if tris is None:
-        verts = []
-        try:
-            text = data.decode("ascii")
-        except UnicodeDecodeError as e:
-            raise ValueError("not a valid binary or ASCII STL") from e
-        for line in text.splitlines():
-            fields = line.split()
-            if fields and fields[0].lower() == "vertex":
-                if len(fields) != 4:
-                    raise ValueError("malformed ASCII STL vertex")
-                try:
-                    verts.append(tuple(float(v) for v in fields[1:]))
-                except ValueError as e:
-                    raise ValueError("malformed ASCII STL vertex") from e
-        if not verts or len(verts) % 3:
-            raise ValueError("ASCII STL does not contain complete triangles")
-        tris = np.asarray(verts, dtype=np.float32).reshape(-1, 3, 3)
-
-    if not np.isfinite(tris).all():
-        raise ValueError("STL contains non-finite coordinates")
-    return tris
+PIN_BASE_RADIUS_MM = 1.5
+PIN_TOP_RADIUS_MM = 0.75
+PIN_HEIGHT_MM = 3.0
+PIN_EMBED_MM = 0.3
+PIN_SEGMENTS = 24
 
 
-def _parse_landmarks(values: list[str], bbox) -> list[dict]:
-    """Parse repeatable ``lat,lon,file[,scale][,rotation]`` CLI values.
-
-    Source STLs use millimetres. They are validated here, before any elevation
-    request, so a bad path/spec never wastes a download.
-    """
+def _parse_pins(values: list[str], bbox) -> list[dict]:
+    """Parse repeatable ``--pin LAT,LON`` values before terrain download."""
     if not values:
         return []
     if not _have_manifold():
-        raise SystemExit("--landmark needs manifold3d:\n"
+        raise SystemExit("--pin needs manifold3d:\n"
                          "  ./.venv/bin/pip install -r requirements.txt")
-    import manifold3d as m3d
 
     min_lat, min_lon, max_lat, max_lon = bbox
-    landmarks = []
+    pins = []
     for raw in values:
         fields = [v.strip() for v in raw.split(",")]
-        if len(fields) not in (3, 4, 5) or any(not v for v in fields[:3]):
-            raise SystemExit(
-                f"--landmark {raw!r}: expected lat,lon,file[,scale][,rotation]")
+        if len(fields) != 2 or any(not v for v in fields):
+            raise SystemExit(f"--pin {raw!r}: expected LAT,LON")
         try:
-            lat, lon = float(fields[0]), float(fields[1])
-            scale = float(fields[3]) if len(fields) >= 4 else 1.0
-            rotation = float(fields[4]) if len(fields) == 5 else 0.0
+            lat, lon = (float(v) for v in fields)
         except ValueError:
-            raise SystemExit(f"--landmark {raw!r}: latitude, longitude, scale "
-                             "and rotation must be numbers") from None
-        if not all(math.isfinite(v) for v in (lat, lon, scale, rotation)):
-            raise SystemExit(f"--landmark {raw!r}: values must be finite")
+            raise SystemExit(
+                f"--pin {raw!r}: latitude and longitude must be numbers") from None
+        if not all(math.isfinite(v) for v in (lat, lon)):
+            raise SystemExit(f"--pin {raw!r}: values must be finite")
         if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
-            raise SystemExit(f"--landmark {raw!r}: invalid latitude/longitude")
+            raise SystemExit(f"--pin {raw!r}: invalid latitude/longitude")
         if not (min_lat <= lat <= max_lat and min_lon <= lon <= max_lon):
-            raise SystemExit(f"--landmark {raw!r}: coordinate is outside the map bbox")
-        if scale <= 0:
-            raise SystemExit(f"--landmark {raw!r}: scale must be greater than zero")
-
-        path = Path(fields[2]).expanduser()
-        if not path.is_file():
-            raise SystemExit(f"--landmark {raw!r}: STL file not found: {path}")
-        try:
-            tris = _read_landmark_stl(path)
-            solid = _soup_to_manifold(tris)
-        except (OSError, ValueError) as e:
-            raise SystemExit(f"--landmark {raw!r}: {e}") from None
-        if solid.is_empty() or solid.status() != m3d.Error.NoError:
-            raise SystemExit(f"--landmark {raw!r}: STL is not a closed solid")
-
-        landmarks.append({"lat": lat, "lon": lon, "path": path,
-                          "input_path": fields[2], "scale": scale,
-                          "rotation": rotation, "tris": tris})
-    return landmarks
+            raise SystemExit(f"--pin {raw!r}: coordinate is outside the map bbox")
+        pins.append({"lat": lat, "lon": lon})
+    return pins
 
 
 def _terrain_min_under(z_mm: np.ndarray, W: float, H: float,
@@ -1361,66 +1296,55 @@ def _terrain_min_under(z_mm: np.ndarray, W: float, H: float,
     return float(block.min()) if block.size else float(z_mm.min())
 
 
-def _prepare_landmarks(landmarks: list[dict], bbox, W: float, H: float,
-                       z_mm: np.ndarray) -> list[dict]:
-    """Scale/rotate landmark soups, center them at their lat/lon, and seat
-    their lowest point just into the terrain. Placement happens once in the
-    assembled model frame; tiled output then clips that exact geometry so a
-    landmark crossing a seam lines up on both tiles.
+def _prepare_pins(pins: list[dict], bbox, W: float, H: float,
+                  z_mm: np.ndarray) -> list[dict]:
+    """Build fixed-size tapered pins once in the assembled model frame.
+
+    Tiled output clips this exact geometry per tile, so a pin crossing a seam
+    stays aligned when the printed pieces are assembled.
     """
     min_lat, min_lon, max_lat, max_lon = bbox
     placed = []
-    for landmark in landmarks:
-        v = landmark["tris"].astype(np.float64, copy=True)
-        lo, hi = v.reshape(-1, 3).min(0), v.reshape(-1, 3).max(0)
-        origin = np.array([(lo[0] + hi[0]) / 2.0,
-                           (lo[1] + hi[1]) / 2.0, lo[2]])
-        v = (v - origin) * landmark["scale"]
-        angle = math.radians(landmark["rotation"])
-        c, s = math.cos(angle), math.sin(angle)
-        x, y = v[:, :, 0].copy(), v[:, :, 1].copy()
-        v[:, :, 0] = c * x - s * y
-        v[:, :, 1] = s * x + c * y
-
-        target_x = (landmark["lon"] - min_lon) / (max_lon - min_lon) * W
-        target_y = (landmark["lat"] - min_lat) / (max_lat - min_lat) * H
-        rel_lo = v.reshape(-1, 3).min(0)
-        rel_hi = v.reshape(-1, 3).max(0)
+    for pin in pins:
+        target_x = (pin["lon"] - min_lon) / (max_lon - min_lon) * W
+        target_y = (pin["lat"] - min_lat) / (max_lat - min_lat) * H
         seat_z = _terrain_min_under(
-            z_mm, W, H, target_x + rel_lo[0], target_y + rel_lo[1],
-            target_x + rel_hi[0], target_y + rel_hi[1])
-        v += np.array([target_x, target_y, seat_z - 0.2])
-        v = v.astype(np.float32)
+            z_mm, W, H, target_x - PIN_BASE_RADIUS_MM,
+            target_y - PIN_BASE_RADIUS_MM, target_x + PIN_BASE_RADIUS_MM,
+            target_y + PIN_BASE_RADIUS_MM)
+        v = np.asarray(_cyl_tris(
+            (target_x, target_y, seat_z - PIN_EMBED_MM), (0, 0, 1),
+            PIN_BASE_RADIUS_MM, PIN_TOP_RADIUS_MM,
+            PIN_HEIGHT_MM + PIN_EMBED_MM, segments=PIN_SEGMENTS),
+            dtype=np.float32)
         bounds = (v.reshape(-1, 3).min(0), v.reshape(-1, 3).max(0))
-        placed.append({**landmark, "tris": v, "bounds": bounds})
-        size = bounds[1] - bounds[0]
-        print(f"Landmark: {landmark['path'].name} at "
-              f"{landmark['lat']:.5f},{landmark['lon']:.5f} -> "
-              f"{size[0]:.1f} x {size[1]:.1f} x {size[2]:.1f} mm, "
-              f"{landmark['rotation']:g}° rotation")
+        placed.append({**pin, "tris": v, "bounds": bounds})
+        print(f"Pin: {pin['lat']:.5f},{pin['lon']:.5f} -> "
+              f"{2 * PIN_BASE_RADIUS_MM:.1f} mm base, "
+              f"{PIN_HEIGHT_MM:.1f} mm raised")
     return placed
 
 
-def add_landmarks(base_tris, landmarks: list[dict], x_offset: float,
-                  y_offset: float, W: float, H: float) -> np.ndarray:
-    """Clip prepared landmark geometry to this model/tile and union it in."""
-    if not landmarks:
+def add_pins(base_tris, pins: list[dict], x_offset: float,
+             y_offset: float, W: float, H: float) -> np.ndarray:
+    """Clip prepared pin geometry to this model/tile and union it in."""
+    if not pins:
         return np.asarray(base_tris, dtype=np.float32)
     import manifold3d as m3d
 
     parts = []
-    for landmark in landmarks:
-        lo, hi = landmark["bounds"]
+    for pin in pins:
+        lo, hi = pin["bounds"]
         if (hi[0] < x_offset or lo[0] > x_offset + W or
                 hi[1] < y_offset or lo[1] > y_offset + H):
             continue
-        v = landmark["tris"].copy()
+        v = pin["tris"].copy()
         v[:, :, 0] -= x_offset
         v[:, :, 1] -= y_offset
-        lm = _soup_to_manifold(v)
+        pin_m = _soup_to_manifold(v)
         clip_z = max(float(hi[2]) + 1.0, 1.0)
         clip = m3d.Manifold.cube([W, H, clip_z])
-        part = lm ^ clip
+        part = pin_m ^ clip
         if not part.is_empty():
             parts.append(part)
 
@@ -1430,8 +1354,8 @@ def add_landmarks(base_tris, landmarks: list[dict], x_offset: float,
     marks = m3d.Manifold.batch_boolean(parts, m3d.OpType.Add)
     res = terrain + marks
     if res.is_empty() or res.status() != m3d.Error.NoError:
-        raise SystemExit("landmark union produced an invalid mesh")
-    print(f"  fused {len(parts)} landmark model(s) into terrain")
+        raise SystemExit("pin union produced an invalid mesh")
+    print(f"  fused {len(parts)} pin(s) into terrain")
     return _manifold_to_soup(res)
 
 
@@ -1828,13 +1752,9 @@ def parse_args(argv=None):
                    help="vertical multiplier for trees only")
     p.add_argument("--tree-min-height", type=float, default=2.0,
                    help="drop vegetation cells below this many metres")
-    p.add_argument("--landmark", action="append", default=[],
-                   metavar="LAT,LON,FILE[,SCALE][,ROTATION]",
-                   help="place a custom closed STL (in mm) at a reference "
-                        "coordinate, centered in X/Y and seated on the terrain; "
-                        "optional uniform scale and counter-clockwise rotation "
-                        "in degrees (viewed from above). Repeat for multiple "
-                        "landmarks (needs "
+    p.add_argument("--pin", action="append", default=[], metavar="LAT,LON",
+                   help="add a 3 mm-wide, 3 mm-high tapered reference marker "
+                        "at this coordinate; repeat for multiple pins (needs "
                         "manifold3d)")
 
     p.add_argument("--tile", help="ROWSxCOLS - split the model into a grid "
@@ -1906,7 +1826,7 @@ def main(argv=None):
     if a.source == "tessadem" and not (-80 <= min_lat and max_lat <= 84):
         raise SystemExit("TessaDEM latitude coverage is -80 to 84")
     bbox = (min_lat, min_lon, max_lat, max_lon)
-    landmarks = _parse_landmarks(a.landmark, bbox)
+    pins = _parse_pins(a.pin, bbox)
 
     if a.tile and a.tile_size:
         try:
@@ -2033,7 +1953,7 @@ def main(argv=None):
         osm=(a.buildings and a.building_source == "osm"))
 
     if a.tile:
-        write_tiles(a, bbox, grid_m, overlay_m, osm_footprints, landmarks,
+        write_tiles(a, bbox, grid_m, overlay_m, osm_footprints, pins,
                     lidar_roofs, out, credit, stl_header)
         if a.view:
             print("  note: --view shows a single STL; pick one tile file to preview")
@@ -2058,10 +1978,10 @@ def main(argv=None):
             a.building_exaggeration, a.building_min_area, a.building_simplify,
             roof_surface_tris=roof_tris, roof_h_m=roof_h)
 
-    placed_landmarks = _prepare_landmarks(
-        landmarks, bbox, info["model_w"], info["model_h"], info["z_mm"])
-    tris = add_landmarks(tris, placed_landmarks, 0.0, 0.0,
-                         info["model_w"], info["model_h"])
+    placed_pins = _prepare_pins(
+        pins, bbox, info["model_w"], info["model_h"], info["z_mm"])
+    tris = add_pins(tris, placed_pins, 0.0, 0.0,
+                    info["model_w"], info["model_h"])
 
     if a.emboss_coords:
         tris = emboss_corner_coords(tris, info, bbox, a.emboss_height,
@@ -2087,7 +2007,7 @@ def main(argv=None):
         "buildings": (a.building_source if a.buildings else None),
         "building_exaggeration": (a.building_exaggeration if a.buildings else None),
         "trees": bool(a.trees),
-        "landmarks": len(landmarks),
+        "pins": [[p["lat"], p["lon"]] for p in pins],
         "generator": "topo2stl",
         "attribution": credit,
         "argv": list(sys.argv[1:]),          # lets viewer.py re-run for a new bbox

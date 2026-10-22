@@ -316,7 +316,7 @@ let firstLoad = true;
 async function poll() {
   let v;
   try {
-    v = await (await fetch('/version', { cache: 'no-store' })).text();
+    v = await (await fetch('./version', { cache: 'no-store' })).text();
   } catch (e) {
     $('err').textContent = 'viewer server not responding';
     setTimeout(poll, 1000);
@@ -331,10 +331,10 @@ async function poll() {
     // file isn't parseable STL (e.g. pointed at the wrong kind of file) -
     // worth a different message than "not responding".
     try {
-      const buf = await (await fetch('/model.stl', { cache: 'no-store' })).arrayBuffer();
+      const buf = await (await fetch('./model.stl', { cache: 'no-store' })).arrayBuffer();
       const geo = loader.parse(buf);
       setModel(geo, firstLoad || name !== currentName);
-      try { applyMeta(await (await fetch('/meta', { cache: 'no-store' })).json()); }
+      try { applyMeta(await (await fetch('./meta', { cache: 'no-store' })).json()); }
       catch (_) { applyMeta(null); }
       currentVersion = v;
       currentName = name;
@@ -529,7 +529,7 @@ $('barea').onclick = e => {
 
 async function checkRegenAvail() {
   try {
-    const r = await (await fetch('/regen/available')).json();
+    const r = await (await fetch('./regen/available')).json();
     $('bregen').disabled = !r.ok;
     $('bsaveas').disabled = !r.ok;
     $('areahint').textContent = r.ok ? '' : r.reason;
@@ -545,7 +545,7 @@ $('bsaveas').onclick = async () => {
   if (!name) { $('saveasname').focus(); return; }
   if (!/\.stl$/i.test(name)) name += '.stl';
   try {
-    const ex = await (await fetch('/exists?name=' + encodeURIComponent(name))).json();
+    const ex = await (await fetch('./exists?name=' + encodeURIComponent(name))).json();
     const what = tiledNow() ? `a ${name.replace(/\.stl$/i, '')} tileset` : name;
     if (ex.exists && !confirm(`${what} already exists - overwrite it?`)) return;
   } catch (_) { /* can't check - proceed, the server still confirms bbox validity */ }
@@ -561,7 +561,7 @@ async function startRegen(title, filename) {
   try {
     const body = { bbox: pend };
     if (filename) body.filename = filename;
-    const j = await (await fetch('/regen', {
+    const j = await (await fetch('./regen', {
       method: 'POST', body: JSON.stringify(body) })).json();
     if (j.error) { regenFail(j.error); return; }
   } catch (e) { regenFail(String(e)); return; }
@@ -574,7 +574,7 @@ function regenFail(msg) {
 }
 async function pollRegen() {
   let s;
-  try { s = await (await fetch('/regen/status', { cache: 'no-store' })).json(); }
+  try { s = await (await fetch('./regen/status', { cache: 'no-store' })).json(); }
   catch (_) { setTimeout(pollRegen, 900); return; }
   const pre = $('regenlog');
   pre.textContent = s.log || '…';

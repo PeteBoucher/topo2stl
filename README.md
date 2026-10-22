@@ -28,8 +28,8 @@ python topo2stl.py --center 37.884,-4.779 --width-km 12 \
 `--view` opens the preview at <http://localhost:8731/>. Leave it open and re-run
 `topo2stl.py` with different settings — it reloads automatically.
 
-Core dependencies are `numpy` and `requests`. `manifold3d` is needed for custom
-landmarks, OSM buildings, tiled output, and engraved coordinates.
+Core dependencies are `numpy` and `requests`. `manifold3d` is needed for POI
+pins, OSM buildings, tiled output, and engraved coordinates.
 
 ---
 
@@ -90,7 +90,7 @@ python topo2stl.py --bbox 36.98,-3.45,37.10,-3.28 --ign-res 5 \
 | `--building-min-area` / `--building-simplify` | osm: drop footprints under N m² (10); simplify tolerance in model mm (0.4). |
 | `--building-roofs` | osm: `flat` (default) or `lidar` — clip prisms to the real LiDAR roofscape (Spain). |
 | `--trees` | Add tree canopy from IGN's vegetation DSM (Spain). `--tree-exaggeration`, `--tree-min-height`. |
-| `--landmark` | Place a custom STL at `lat,lon` as a recognizable reference point; repeatable — see below. |
+| `--pin LAT,LON` | Add a small raised marker at a known point for orienting the finished print; repeatable — see below. |
 | `--tile ROWSxCOLS` | Split the model into a grid of tiles that each fit `--bed-size`, keyed with peg/socket seams — see below. Pair with `--tile-size` (mm per tile) rather than `--model-width` (the whole assembled map's width, not one tile's). |
 | `--emboss-coords` | Engrave each side wall's edge coordinate (see below). |
 | `--emboss-style` | `engraved` (cut in, default — needs `manifold3d`) or `raised` (stands proud). |
@@ -157,6 +157,9 @@ re-splitting it into more tiles isn't a sensible operation.
 > The viewer loads three.js from a CDN, so it needs an internet connection the
 > first time a browser caches it.
 
+The viewer fetches its model and control endpoints relative to the page URL, so
+it also works when served below a path-prefix proxy such as Facility Preview.
+
 ---
 
 ## Buildings
@@ -219,34 +222,26 @@ Notes:
 
 ---
 
-## Landmark reference models
+## POI reference pins
 
-`--landmark` fuses a recognizable model at a known point on the terrain, giving
-the finished print an immediate orientation reference. Supply a closed STL in
-millimetres and the point where its X/Y centre belongs:
+`--pin LAT,LON` fuses a small raised marker at a known point on the terrain,
+giving the finished print an immediate orientation reference:
 
 ```bash
 python topo2stl.py --center 37.879,-4.779 --width-km 2 \
-  --model-width 180 --landmark "37.8789,-4.7794,giralda.stl" \
+  --model-width 180 --pin 37.8789,-4.7794 \
   -o cordoba.stl --view
 ```
 
-The full syntax is `lat,lon,file.stl[,scale][,rotation]`. `scale` is a uniform
-multiplier (default `1`); `rotation` is degrees counter-clockwise when viewed
-from above (default `0`). For example, `...,tower.stl,0.5,90` makes the source
-half-size and turns it 90 degrees. Repeat `--landmark` to add more than one.
+The marker is a flat-topped taper with a 3 mm base and rises 3 mm above the
+local surface: wide enough for a typical 0.4 mm nozzle, with no point to string
+or support to remove. Its size is in printed millimetres and is not affected by
+`--z-exaggeration`. Repeat `--pin` to mark more than one POI.
 
-The source mesh must be a closed solid in binary or ASCII STL format and the
-coordinate must fall inside the map bounding box. topo2stl centres its X/Y
-bounds on that coordinate, puts its lowest point just into the terrain, clips
-anything beyond the map edge, and unions it into one printable solid. On a
-multi-tile map, a landmark crossing a seam is clipped between the affected
-tiles in the assembled coordinate frame, so both halves line up.
-
-This feature needs `manifold3d`. Custom models keep their own physical STL size
-and are not affected by `--z-exaggeration`; use the optional `scale` instead.
-Check the source model's licence and add any required attribution when sharing
-or selling the finished map.
+The coordinate must fall inside the map bounding box. The pin is embedded
+slightly and unioned into the terrain as one printable solid (`manifold3d` is
+required). On a multi-tile map, a pin crossing a seam is clipped between the
+affected tiles in the assembled coordinate frame, so both halves line up.
 
 ---
 
@@ -366,8 +361,8 @@ mode - the gap already shows where the cuts are).
 3. Build the mesh: triangulated top surface + four vertical walls + flat bottom,
    consistently wound outward. Longitude is `cos(latitude)`-corrected so
    proportions stay true.
-4. Optionally union buildings and custom landmark models, then engrave the
-   coordinates via CSG.
+4. Optionally union buildings and POI pins, then engrave the coordinates via
+   CSG.
 5. Write a binary STL in millimetres, sitting on the `z = 0` plane.
 
 ```text
