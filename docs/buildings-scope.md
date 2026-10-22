@@ -107,13 +107,14 @@ towers below the printable minimum (enforce a min footprint / min prism width).
 
 - **Phase 1**: nothing special — the Mezquita, Cathedral, Alcázar etc. are in
   OSM/Catastro/MDSn and extrude into recognisable blocks by their footprint.
-- **Phase 2**: `--landmark "lat,lon,model.stl[,scale][,rotate]"` (repeatable) —
+- **Phase 2** *(implemented)*: `--landmark "lat,lon,model.stl[,scale][,rotate]"`
+  (repeatable) —
   drop a user-supplied 3D mesh (own scan, CC model from Sketchfab/Wikimedia) at
   a coordinate, seated on the terrain, unioned in. Lets you put a real Giralda
   or Alhambra on the map without solving heritage 3D acquisition.
 - **Phase 3** (maybe never): a small curated landmark library keyed by name.
 
-## Proposed CLI
+## CLI
 
 ```
 --buildings                     add building massing (implies a scale check)
